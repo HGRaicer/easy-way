@@ -1,0 +1,12 @@
+{
+  "name": "routing-mvp-cpp",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "nlohmann-json",
+    "spdlog",
+    "libosmium",
+    "zlib",
+    "bzip2",
+    "expat"
+  ]
+}

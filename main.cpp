@@ -27,7 +27,7 @@ static void usage(const char* exe) {
         << "Usage:\n"
         << "  " << exe << " osm-info   --pbf <file.osm.pbf>\n"
         << "  " << exe << " preprocess --pbf <file.osm.pbf> --out <graph.bin> [--map <map.csv>]\n"
-        << "  " << exe << " search     --graph <graph.bin> --in <queries.txt> --out <result.txt> [--full]\n"
+        << "  " << exe << " search     --graph <graph.bin> --in <queries.txt> --out <result.txt> --metric <time/distance>[--full]\n"
         << "\n"
         << "Notes:\n"
         << "  - preprocess creates a dense graph: query node ids are 1..N\n"
@@ -216,6 +216,7 @@ int main(int argc, char** argv) {
     if (cmd == "search") {
         std::string graph, in, out;
         bool full = false;
+        SearchMetric metric = SearchMetric::Distance;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -224,6 +225,12 @@ int main(int argc, char** argv) {
             else if (a == "--out") out = take_value(i, argc, argv);
             else if (a == "--full") full = true;
             else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
+            else if (a == "--metric") {
+                const std::string m = take_value(i, argc, argv);
+                if (m == "distance") metric = SearchMetric::Distance;
+                else if (m == "time") metric = SearchMetric::Time;
+                else { std::cerr << "Unknown metric: " << m << "\n"; return 1; }
+            }
         }
 
         if (graph.empty() || in.empty() || out.empty()) {
@@ -273,7 +280,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        run_search(gf, inf, outf, full);
+        run_search(gf, inf, outf, full, metric);
 
         fclose(outf);
         fclose(inf);

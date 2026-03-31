@@ -1,162 +1,307 @@
-#include "search.h"
+п»ї#include "search.h"
+
+#include <vector>
+#include <queue>
 #include <cmath>
 #include <algorithm>
 #include <limits>
-#include <cstdio>
+#include <cstdint>
+#include <cstring>
 
 constexpr double PI = 3.141592653589793;
 constexpr double EARTH_RADIUS = 6371000.0;
 
-static double haversine(const SearchNode& a, const SearchNode& b) noexcept {
-    double dlat = (b.lat - a.lat) * PI / 180.0;
-    double dlon = (b.lon - a.lon) * PI / 180.0;
+// For time heuristic: should be >= any modeled road speed. 60 m/s в‰€ 216 km/h (safe)
+constexpr double VMAX_MPS = 60.0;
 
-    double lat1_rad = a.lat * PI / 180.0;
-    double lat2_rad = b.lat * PI / 180.0;
+struct NodeCoord {
+    double lat{};
+    double lon{};
+};
 
-    double sin_dlat = sin(dlat * 0.5);
-    double sin_dlon = sin(dlon * 0.5);
-
-    double a_val = sin_dlat * sin_dlat + cos(lat1_rad) * cos(lat2_rad) * sin_dlon * sin_dlon;
-    return 2.0 * EARTH_RADIUS * asin(sqrt(a_val));
-}
-
-static size_t binarySearch(const std::vector<uint32_t>& ids, uint32_t target) noexcept {
-    size_t left = 0, right = ids.size();
-    while (left < right) {
-        size_t mid = left + (right - left) / 2;
-        if (ids[mid] < target) left = mid + 1;
-        else right = mid;
+struct PQItem {
+    uint32_t node{};
+    double f{};
+    bool operator>(const PQItem& o) const noexcept {
+        return f > o.f || (f == o.f && node > o.node);
     }
-    return (left < ids.size() && ids[left] == target) ? left : size_t(-1);
+};
+
+static double haversine(const NodeCoord& a, const NodeCoord& b) noexcept {
+    const double dlat = (b.lat - a.lat) * PI / 180.0;
+    const double dlon = (b.lon - a.lon) * PI / 180.0;
+
+    const double lat1 = a.lat * PI / 180.0;
+    const double lat2 = b.lat * PI / 180.0;
+
+    const double s1 = std::sin(dlat * 0.5);
+    const double s2 = std::sin(dlon * 0.5);
+
+    const double x = s1 * s1 + std::cos(lat1) * std::cos(lat2) * s2 * s2;
+    return 2.0 * EARTH_RADIUS * std::asin(std::sqrt(x));
 }
 
-static SearchNode getNode(FILE* file, uint32_t coord_offset, size_t index) noexcept {
-    fseek(file, coord_offset + static_cast<long>(index * 2 * sizeof(double)), SEEK_SET);
-    SearchNode node{};
-    fread(&node.lat, sizeof(double), 1, file);
-    fread(&node.lon, sizeof(double), 1, file);
-    return node;
+static long long tell64(FILE* f) {
+#if defined(_WIN32)
+    return _ftelli64(f);
+#else
+    return ftell(f);
+#endif
 }
 
-static double aStar(uint32_t start_id, uint32_t goal_id,
-    const std::vector<uint32_t>& ids,
-    const std::vector<uint32_t>& offsets,
-    FILE* graph_file,
-    uint32_t coord_offset,
-    uint32_t adj_offset,
-    std::vector<double>& g_scores,
-    std::vector<double>& f_scores,
-    std::vector<uint32_t>& parents) {
+static int seek64(FILE* f, long long off, int whence) {
+#if defined(_WIN32)
+    return _fseeki64(f, off, whence);
+#else
+    return fseek(f, off, whence);
+#endif
+}
 
-    size_t start = binarySearch(ids, start_id);
-    size_t goal = binarySearch(ids, goal_id);
-    if (start == size_t(-1) || goal == size_t(-1)) return -1.0;
+// graph.bin v2 light:
+// magic[4]="GBIN", version(u32)=2, N(u64), flags(u32 bit0=speed_present)
+// then: ids[u32*N], coords[double*2N], offsets[u32*N], adjacency[u32*M], speed_mps[float*M]
+struct GraphHeaderV2 {
+    uint32_t version{};
+    uint64_t N{};
+    uint32_t flags{};
+};
 
-    std::fill(g_scores.begin(), g_scores.end(), -1.0);
-    std::fill(f_scores.begin(), f_scores.end(), -1.0);
+static bool read_header_v2(FILE* f, GraphHeaderV2& h) {
+    unsigned char magic[4];
+    if (fread(magic, 1, 4, f) != 4) return false;
+    if (std::memcmp(magic, "GBIN", 4) != 0) return false;
 
-    std::priority_queue<PathEntry, std::vector<PathEntry>, std::greater<PathEntry>> pq;
+    if (fread(&h.version, sizeof(uint32_t), 1, f) != 1) return false;
+    if (h.version != 2) return false;
 
-    SearchNode goal_node = getNode(graph_file, coord_offset, goal);
-    SearchNode start_node = getNode(graph_file, coord_offset, start);
+    if (fread(&h.N, sizeof(uint64_t), 1, f) != 1) return false;
+    if (fread(&h.flags, sizeof(uint32_t), 1, f) != 1) return false;
 
-    g_scores[start] = 0.0;
-    f_scores[start] = haversine(start_node, goal_node);
-    pq.push({ static_cast<uint32_t>(start), f_scores[start] });
-    parents[start] = static_cast<uint32_t>(start);
+    return true;
+}
 
-    while (!pq.empty()) {
-        uint32_t current = pq.top().node;
-        double current_cost = pq.top().cost;
-        pq.pop();
+void run_search(FILE* graph_file,
+    FILE* input_file,
+    FILE* output_file,
+    bool full_output,
+    SearchMetric metric) {
+    if (!graph_file || !input_file || !output_file) return;
 
-        if (current == goal) return g_scores[goal];
-        if (current_cost > f_scores[current]) continue;
+    seek64(graph_file, 0, SEEK_SET);
 
-        uint32_t edge_start = (current == 0) ? 0 : offsets[current - 1];
-        uint32_t edge_count = offsets[current] - edge_start;
+    GraphHeaderV2 h2{};
+    const long long start_pos = tell64(graph_file);
+    const bool is_v2 = read_header_v2(graph_file, h2);
 
-        std::vector<uint32_t> neighbors(edge_count);
-        fseek(graph_file, adj_offset + static_cast<long>(edge_start * sizeof(uint32_t)), SEEK_SET);
-        fread(neighbors.data(), sizeof(uint32_t), edge_count, graph_file);
+    uint64_t N64 = 0;
+    uint32_t flags = 0;
+    long long base_after_header = 0;
 
-        SearchNode current_node = getNode(graph_file, coord_offset, current);
+    if (is_v2) {
+        N64 = h2.N;
+        flags = h2.flags;
+        base_after_header = tell64(graph_file);
+    }
+    else {
+        // old format fallback: supports only distance and has no speed array
+        if (metric == SearchMetric::Time) {
+            fprintf(output_file, "ERROR: old graph.bin supports only distance. Re-run preprocess.\n");
+            return;
+        }
+        seek64(graph_file, start_pos, SEEK_SET);
 
-        for (uint32_t neighbor_id : neighbors) {
-            size_t neighbor_idx = binarySearch(ids, neighbor_id);
-            if (neighbor_idx == size_t(-1)) continue;
+        size_t n_old = 0;
+        if (fread(&n_old, sizeof(size_t), 1, graph_file) != 1) {
+            fprintf(output_file, "ERROR: can't read old header.\n");
+            return;
+        }
+        N64 = static_cast<uint64_t>(n_old);
+        flags = 0;
+        base_after_header = static_cast<long long>(sizeof(size_t));
+    }
 
-            SearchNode neighbor_node = getNode(graph_file, coord_offset, neighbor_idx);
+    if (N64 == 0 || N64 > std::numeric_limits<uint32_t>::max()) {
+        fprintf(output_file, "ERROR: invalid N\n");
+        return;
+    }
+    const uint32_t N = static_cast<uint32_t>(N64);
 
-            double edge_cost = haversine(current_node, neighbor_node);
-            double tentative_g = g_scores[current] + edge_cost;
+    // ids
+    std::vector<uint32_t> ids(N);
+    fread(ids.data(), sizeof(uint32_t), N, graph_file);
 
-            if (g_scores[neighbor_idx] < 0 || tentative_g + 1e-9 < g_scores[neighbor_idx]) {
-                g_scores[neighbor_idx] = tentative_g;
-                f_scores[neighbor_idx] = tentative_g + haversine(neighbor_node, goal_node);
-                parents[neighbor_idx] = current;
-                pq.push({ static_cast<uint32_t>(neighbor_idx), f_scores[neighbor_idx] });
+    // coords
+    const long long coord_offset = base_after_header + static_cast<long long>(N) * sizeof(uint32_t);
+    seek64(graph_file, coord_offset, SEEK_SET);
+
+    std::vector<NodeCoord> coords(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        fread(&coords[i].lat, sizeof(double), 1, graph_file);
+        fread(&coords[i].lon, sizeof(double), 1, graph_file);
+    }
+
+    // offsets
+    const long long offsets_offset = coord_offset + static_cast<long long>(N) * 2LL * sizeof(double);
+    seek64(graph_file, offsets_offset, SEEK_SET);
+
+    std::vector<uint32_t> offsets(N);
+    fread(offsets.data(), sizeof(uint32_t), N, graph_file);
+
+    const uint32_t M = offsets[N - 1];
+    const long long adj_offset = offsets_offset + static_cast<long long>(N) * sizeof(uint32_t);
+
+    const bool speed_present = is_v2 && ((flags & 1u) != 0u);
+    const long long speed_offset = speed_present
+        ? (adj_offset + static_cast<long long>(M) * sizeof(uint32_t))
+        : 0;
+
+    if (metric == SearchMetric::Time && !speed_present) {
+        fprintf(output_file, "ERROR: graph.bin has no speed array. Re-run preprocess.\n");
+        return;
+    }
+
+    // A* buffers
+    std::vector<double> g(N, std::numeric_limits<double>::infinity());
+    std::vector<double> f(N, std::numeric_limits<double>::infinity());
+    std::vector<uint32_t> parent(N, 0);
+    std::vector<float> parent_speed(N, 1.0f); // speed used to reach node from parent
+
+    auto heuristic = [&](uint32_t u, uint32_t goal) -> double {
+        const double d = haversine(coords[u], coords[goal]);
+        if (metric == SearchMetric::Distance) return d;         // meters
+        return d / VMAX_MPS;                                    // seconds
+        };
+
+    auto read_neighbors = [&](uint32_t u, std::vector<uint32_t>& neigh, std::vector<float>& speed) {
+        const uint32_t start = (u == 0) ? 0 : offsets[u - 1];
+        const uint32_t end = offsets[u];
+        const uint32_t cnt = end - start;
+
+        neigh.resize(cnt);
+        seek64(graph_file, adj_offset + static_cast<long long>(start) * sizeof(uint32_t), SEEK_SET);
+        fread(neigh.data(), sizeof(uint32_t), cnt, graph_file);
+
+        speed.resize(cnt);
+        if (speed_present) {
+            seek64(graph_file, speed_offset + static_cast<long long>(start) * sizeof(float), SEEK_SET);
+            fread(speed.data(), sizeof(float), cnt, graph_file);
+        }
+        else {
+            for (uint32_t i = 0; i < cnt; ++i) speed[i] = 1.0f;
+        }
+        };
+
+    // Input pairs: 1..N
+    uint32_t src1 = 0, dst1 = 0;
+    while (fscanf(input_file, "%u%u", &src1, &dst1) == 2) {
+        if (src1 == 0 || dst1 == 0 || src1 > N || dst1 > N) {
+            // time dist [k path...]
+            fprintf(output_file, "-1 -1");
+            if (full_output) fprintf(output_file, " 0\n");
+            else fprintf(output_file, "\n");
+            continue;
+        }
+
+        const uint32_t start = src1 - 1;
+        const uint32_t goal = dst1 - 1;
+
+        std::fill(g.begin(), g.end(), std::numeric_limits<double>::infinity());
+        std::fill(f.begin(), f.end(), std::numeric_limits<double>::infinity());
+        for (uint32_t i = 0; i < N; ++i) {
+            parent[i] = i;
+            parent_speed[i] = 1.0f;
+        }
+
+        std::priority_queue<PQItem, std::vector<PQItem>, std::greater<PQItem>> pq;
+
+        g[start] = 0.0;
+        f[start] = heuristic(start, goal);
+        pq.push({ start, f[start] });
+
+        bool found = false;
+        std::vector<uint32_t> neigh;
+        std::vector<float> speed;
+
+        while (!pq.empty()) {
+            const auto cur = pq.top();
+            pq.pop();
+
+            const uint32_t u = cur.node;
+            if (cur.f > f[u]) continue;
+
+            if (u == goal) {
+                found = true;
+                break;
+            }
+
+            read_neighbors(u, neigh, speed);
+
+            for (size_t i = 0; i < neigh.size(); ++i) {
+                const uint32_t v = neigh[i];
+
+                const double dist_m = haversine(coords[u], coords[v]);
+                const double sp = std::max(0.1f, speed[i]);
+
+                double edge_cost = 0.0;
+                if (metric == SearchMetric::Distance) edge_cost = dist_m;
+                else edge_cost = dist_m / sp;
+
+                const double cand = g[u] + edge_cost;
+                if (cand + 1e-12 < g[v]) {
+                    g[v] = cand;
+                    f[v] = cand + heuristic(v, goal);
+                    parent[v] = u;
+                    parent_speed[v] = static_cast<float>(sp); // remember speed for this parent edge
+                    pq.push({ v, f[v] });
+                }
             }
         }
-    }
 
-    return g_scores[goal];
-}
+        if (!found || !std::isfinite(g[goal])) {
+            fprintf(output_file, "-1 -1");
+            if (full_output) fprintf(output_file, " 0\n");
+            else fprintf(output_file, "\n");
+            continue;
+        }
 
-void run_search(FILE* graph_file, FILE* input_file, FILE* output_file, bool full_output) {
-    fseek(graph_file, 0, SEEK_SET);
+        // Reconstruct path ALWAYS (we need it to compute both time and distance)
+        std::vector<uint32_t> path;
+        {
+            uint32_t cur = goal;
+            path.push_back(cur);
+            while (cur != start) {
+                const uint32_t p = parent[cur];
+                if (p == cur) break; // safety
+                cur = p;
+                path.push_back(cur);
+            }
+            std::reverse(path.begin(), path.end());
+        }
 
-    size_t num_nodes = 0;
-    fread(&num_nodes, sizeof(num_nodes), 1, graph_file);
+        // Compute both metrics on this path
+        double total_dist_m = 0.0;
+        double total_time_s = 0.0;
 
-    std::vector<uint32_t> ids(num_nodes);
-    fread(ids.data(), sizeof(uint32_t), num_nodes, graph_file);
+        if (path.size() >= 2) {
+            for (size_t i = 1; i < path.size(); ++i) {
+                const uint32_t u = path[i - 1];
+                const uint32_t v = path[i];
+                const double d = haversine(coords[u], coords[v]);
+                total_dist_m += d;
 
-    uint32_t coord_offset = static_cast<uint32_t>(sizeof(size_t) + num_nodes * sizeof(uint32_t));
-    uint32_t offset_offset = coord_offset + static_cast<uint32_t>(num_nodes * 2 * sizeof(double));
+                // speed for node v is the edge (parent[v] -> v)
+                const double sp = std::max(0.1f, parent_speed[v]);
+                total_time_s += d / sp;
+            }
+        }
 
-    fseek(graph_file, offset_offset, SEEK_SET);
-    std::vector<uint32_t> offsets(num_nodes);
-    fread(offsets.data(), sizeof(uint32_t), num_nodes, graph_file);
-
-    uint32_t adj_offset = offset_offset + static_cast<uint32_t>(num_nodes * sizeof(uint32_t));
-
-    std::vector<double> g_scores(num_nodes + 1, -1.0);
-    std::vector<double> f_scores(num_nodes + 1, -1.0);
-    std::vector<uint32_t> parents(num_nodes + 1);
-
-    uint32_t src_id, dst_id;
-    while (fscanf(input_file, "%u%u", &src_id, &dst_id) == 2) {
-        // вход: 1..N, внутри: 0..N-1
-        double distance = aStar(src_id - 1, dst_id - 1,
-            ids, offsets,
-            graph_file, coord_offset, adj_offset,
-            g_scores, f_scores, parents);
-
-        if (distance < 0) fprintf(output_file, "-1");
-        else fprintf(output_file, "%.6f", distance);
+        // OUTPUT: time first, then distance
+        fprintf(output_file, "%.6f %.6f", total_time_s, total_dist_m);
 
         if (full_output) {
-            if (distance < 0) {
-                fprintf(output_file, " 0");
-            }
-            else {
-                size_t current = binarySearch(ids, dst_id - 1);
-                size_t start_idx = binarySearch(ids, src_id - 1);
-
-                std::vector<uint32_t> path;
-                path.push_back(ids[current]);
-
-                while (current != start_idx) {
-                    current = parents[current];
-                    path.push_back(ids[current]);
-                }
-
-                fprintf(output_file, " %zu", path.size());
-                for (int i = static_cast<int>(path.size()) - 1; i >= 0; --i) {
-                    fprintf(output_file, " %u", path[i] + 1);
-                }
+            fprintf(output_file, " %zu", path.size());
+            for (uint32_t v : path) {
+                fprintf(output_file, " %u", v + 1); // back to 1..N
             }
         }
 

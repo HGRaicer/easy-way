@@ -179,7 +179,7 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
       "args": [
         "osm-info",
         "--pbf",
-        "../../data/your_city.osm.pbf"
+        "../../data/central-fed-district-260214.osm.pbf"
       ],
       "cwd": "${workspaceRoot}"
     },
@@ -191,7 +191,7 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
       "args": [
         "preprocess",
         "--pbf",
-        "../../data/your_city.osm.pbf",
+        "../../data/central-fed-district-260214.osm.pbf",
         "--out",
         "graph.bin",
         "--map",
@@ -200,7 +200,7 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
       "cwd": "${workspaceRoot}"
     },
     {
-      "name": "Search",
+      "name": "Search time",
       "type": "default",
       "project": "CMakeLists.txt",
       "projectTarget": "",
@@ -212,7 +212,28 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
         "../../queries.txt",
         "--out",
         "../../../result.txt",
-        "--full"
+        "--full",
+        "--metric",
+        "time"
+      ],
+      "cwd": "${workspaceRoot}"
+    },
+    {
+      "name": "Search dist",
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "",
+      "args": [
+        "search",
+        "--graph",
+        "graph.bin",
+        "--in",
+        "../../queries.txt",
+        "--out",
+        "../../../result.txt",
+        "--full",
+        "--metric",
+        "distance"
       ],
       "cwd": "${workspaceRoot}"
     },

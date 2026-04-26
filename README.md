@@ -238,6 +238,20 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
       "cwd": "${workspaceRoot}"
     },
     {
+      "name": "Visualize",
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "",
+      "args": [
+        "visualize",
+        "--graph",
+        "graph.bin",
+        "--result",
+        "../../../result.txt",
+      ],
+      "cwd": "${workspaceRoot}"
+    },
+    {
       "type": "default",
       "project": "CMakeLists.txt",
       "projectTarget": "",

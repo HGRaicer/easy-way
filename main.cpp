@@ -1,6 +1,8 @@
+#include "visualizer.hpp"
 #include "osm_graph.hpp"
 #include "preprocess.hpp"
 #include "search.h"
+
 
 #include <filesystem>
 #include <iostream>
@@ -8,19 +10,19 @@
 #include <vector>
 #include <cstdio>
 #include <system_error>
-
+/*
 #ifdef _WIN32
 #include <windows.h>
-#endif
+#endif*/
 
 namespace fs = std::filesystem;
-
+/*
 static void enable_utf8_console() {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
-}
+}*/
 
 static void usage(const char* exe) {
     std::cerr
@@ -28,6 +30,7 @@ static void usage(const char* exe) {
         << "  " << exe << " osm-info   --pbf <file.osm.pbf>\n"
         << "  " << exe << " preprocess --pbf <file.osm.pbf> --out <graph.bin> [--map <map.csv>]\n"
         << "  " << exe << " search     --graph <graph.bin> --in <queries.txt> --out <result.txt> --metric <time/distance>[--full]\n"
+        << "  " << exe << " visualize --graph <graph.bin> [--result <result.txt>]\n"
         << "\n"
         << "Notes:\n"
         << "  - preprocess creates a dense graph: query node ids are 1..N\n"
@@ -107,7 +110,7 @@ static void print_not_found(const char* label, const ResolveResult& rr) {
 }
 
 int main(int argc, char** argv) {
-    enable_utf8_console();
+    //enable_utf8_console();
 
     if (argc < 2) {
         usage(argv[0]);
@@ -289,7 +292,40 @@ int main(int argc, char** argv) {
         std::cout << "Search OK\n";
         return 0;
     }
+    
+    if (cmd == "visualize") {
+        std::string graph, result_txt;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--graph") graph = take_value(i, argc, argv);
+            else if (a == "--result") result_txt = take_value(i, argc, argv);
+            else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
+        }
+        if (graph.empty()) {
+            usage(argv[0]); return 1;
+        }
 
+        auto graph_rr = resolve_existing(graph, cwd, exe_dir);
+        if (!graph_rr.found) {
+            print_not_found("Graph", graph_rr); return 1;
+        }
+
+        GraphVisualizer viz;
+        viz.load(graph_rr.path.string());
+
+        if (!result_txt.empty()) {
+            auto res_rr = resolve_existing(result_txt, cwd, exe_dir);
+            if (res_rr.found) {
+                std::vector<Route> loaded;
+                load_routes_from_file(res_rr.path.string(), loaded);
+                for (auto& r : loaded) viz.add_route(r);
+            }
+        }
+
+        std::cout << "Запуск визуализатора...\n";
+        viz.run();
+        return 0;
+    }
     usage(argv[0]);
     return 1;
 }

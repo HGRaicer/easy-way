@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 #include <limits>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -36,25 +37,42 @@ static int parse_leading_int(std::string_view s) {
 
 static int default_speed_kph(std::string_view highway) {
     if (highway == "motorway") return 110;
+    if (highway == "motorway_link") return 70;
+
     if (highway == "trunk") return 90;
+    if (highway == "trunk_link") return 60;
+
     if (highway == "primary") return 80;
+    if (highway == "primary_link") return 50;
+
     if (highway == "secondary") return 70;
+    if (highway == "secondary_link") return 45;
+
     if (highway == "tertiary") return 60;
+    if (highway == "tertiary_link") return 40;
+
     if (highway == "residential") return 50;
     if (highway == "unclassified") return 50;
+    if (highway == "road") return 40;
     if (highway == "living_street") return 10;
     if (highway == "service") return 20;
+
     return 50;
 }
 
 static bool is_drivable_highway(const char* highway) {
     if (!highway) return false;
-    static const std::vector<std::string_view> ok = {
-        "motorway","trunk","primary","secondary","tertiary",
-        "unclassified","residential","service","living_street"
+    static const std::unordered_set<std::string_view> ok = {
+        "motorway", "motorway_link",
+        "trunk", "trunk_link",
+        "primary", "primary_link",
+        "secondary", "secondary_link",
+        "tertiary", "tertiary_link",
+        "unclassified", "residential",
+        "service", "living_street",
+        "road"
     };
-    for (auto v : ok) if (v == highway) return true;
-    return false;
+    return ok.count(highway) > 0;
 }
 
 // oneway: 0 two-way, 1 forward, -1 reverse

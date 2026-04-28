@@ -8,6 +8,7 @@ add_executable(graph_builder
     src/osm_graph.cpp
     src/preprocess.cpp
     src/search.cpp
+    src/geocode.cpp
 )
 
 target_compile_features(graph_builder PRIVATE cxx_std_17)

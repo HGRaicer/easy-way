@@ -7,6 +7,7 @@
     "libosmium",
     "zlib",
     "bzip2",
-    "expat"
+    "expat",
+    "qtbase"
   ]
 }

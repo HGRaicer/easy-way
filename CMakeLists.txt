@@ -12,6 +12,7 @@ add_executable(graph_builder
     src/osm_graph.cpp
     src/preprocess.cpp
     src/search.cpp
+    src/geocode.cpp
     src/visualizer.cpp
     src/graph_loader.cpp
 )

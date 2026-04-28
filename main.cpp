@@ -2,6 +2,7 @@
 #include "osm_graph.hpp"
 #include "preprocess.hpp"
 #include "search.h"
+#include "geocode.hpp"
 
 
 #include <filesystem>
@@ -240,6 +241,48 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 1;
         }
+
+        fs::path in_path(in);
+        fs::path in_dir = in_path.parent_path();
+        fs::path input_txt_path = in_dir / "input.txt";
+
+        std::error_code ec;
+        if (!fs::exists(input_txt_path, ec)) {
+            std::cerr << "\nERROR: input.txt not found at: " << input_txt_path.string() << "\n";
+            std::cerr << "Please create input.txt with coordinates in format:\n";
+            std::cerr << "  lat1 lon1 lat2 lon2\n";
+            std::cerr << "Example:\n";
+            std::cerr << "  57.2834 34.8924 57.3558 34.8520\n";
+            return 1;
+        }
+
+        // »щем id_map.csv
+        fs::path map_csv_path = exe_dir / "id_map.csv";
+        if (!fs::exists(map_csv_path, ec)) {
+            map_csv_path = cwd / "id_map.csv";
+        }
+
+        if (!fs::exists(map_csv_path, ec)) {
+            std::cerr << "\nERROR: id_map.csv not found\n";
+            std::cerr << "Expected locations:\n";
+            std::cerr << "  - " << (exe_dir / "id_map.csv").string() << "\n";
+            std::cerr << "  - " << (cwd / "id_map.csv").string() << "\n";
+            return 1;
+        }
+
+        std::cerr << "Found input.txt, converting coordinates to IDs..." << std::endl;
+        std::cerr << "Using map: " << map_csv_path.string() << std::endl;
+
+        std::string err;
+        if (!convert_coordinates_to_ids(map_csv_path.string(),
+            input_txt_path.string(),
+            in_path.string(),
+            err)) {
+            std::cerr << "\nERROR: Conversion failed: " << err << "\n";
+            return 1;
+        }
+
+        std::cerr << "Successfully converted coordinates to " << in_path.string() << std::endl;
 
         auto graph_rr = resolve_existing(graph, cwd, exe_dir);
         if (!graph_rr.found) {

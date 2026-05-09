@@ -4,38 +4,27 @@
 #include "search.h"
 #include "geocode.hpp"
 
-
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <string>
-#include <vector>
-#include <cstdio>
 #include <system_error>
-/*
-#ifdef _WIN32
-#include <windows.h>
-#endif*/
+#include <vector>
 
 namespace fs = std::filesystem;
-/*
-static void enable_utf8_console() {
-#ifdef _WIN32
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-#endif
-}*/
 
 static void usage(const char* exe) {
     std::cerr
         << "Usage:\n"
         << "  " << exe << " osm-info   --pbf <file.osm.pbf>\n"
-        << "  " << exe << " preprocess --pbf <file.osm.pbf> --out <graph.bin> [--map <map.csv>]\n"
-        << "  " << exe << " search     --graph <graph.bin> --in <queries.txt> --out <result.txt> --metric <time/distance>[--full]\n"
-        << "  " << exe << " visualize --graph <graph.bin> [--result <result.txt>]\n"
+        << "  " << exe << " preprocess --pbf <file.osm.pbf> --out <graph.bin> [--map <id_map.csv>]\n"
+        << "  " << exe << " search     --graph <graph.bin> --in <input.txt> [--queries <queries.txt|dir>] --out <result.txt> --metric <time/distance> [--full]\n"
+        << "  " << exe << " visualize  --graph <graph.bin> [--result <result.txt>]\n"
         << "\n"
         << "Notes:\n"
         << "  - preprocess creates a dense graph: query node ids are 1..N\n"
-        << "  - map.csv contains mapping dense_id -> original osm_id\n";
+        << "  - id_map.csv contains mapping dense_id -> original osm_id and coordinates\n"
+        << "  - search reads coordinate input.txt, writes generated queries.txt, then routes using that exact queries.txt\n";
 }
 
 static std::string take_value(int& i, int argc, char** argv) {
@@ -55,51 +44,109 @@ static ResolveResult resolve_existing(const fs::path& p,
     ResolveResult rr;
     if (p.empty()) {
         rr.path = p;
-        rr.found = false;
         return rr;
     }
 
     std::error_code ec;
+    std::vector<fs::path> tries;
 
-    // Если абсолютный и существует
-    if (p.is_absolute() && fs::exists(p, ec) && !ec) {
-        rr.path = p;
-        rr.found = true;
-        rr.tried = { p };
-        return rr;
+    if (p.is_absolute()) {
+        tries.push_back(p);
+    }
+    else {
+        tries.push_back(p);
+        tries.push_back(cwd / p);
+        tries.push_back(exe_dir / p);
+        tries.push_back(exe_dir.parent_path() / p);
+        tries.push_back(exe_dir.parent_path().parent_path() / p);
+
+        fs::path abs = fs::absolute(p, ec);
+        if (!ec && !abs.empty()) tries.push_back(abs);
     }
 
-    // Пробуем набор типичных мест
-    std::vector<fs::path> tries;
-    tries.push_back(p);
-    tries.push_back(cwd / p);
-    tries.push_back(exe_dir / p);
-    tries.push_back(exe_dir.parent_path() / p);
-    tries.push_back(exe_dir.parent_path().parent_path() / p);
-
-    // И абсолютный вариант
-    fs::path abs = fs::absolute(p, ec);
-    if (!abs.empty()) tries.push_back(abs);
-
     rr.tried = tries;
-
     for (const auto& t : tries) {
         if (fs::exists(t, ec) && !ec) {
             rr.path = t;
             rr.found = true;
             return rr;
         }
+        ec.clear();
     }
 
     rr.path = p;
-    rr.found = false;
     return rr;
+}
+
+static ResolveResult resolve_input_txt(const fs::path& arg,
+    const fs::path& cwd,
+    const fs::path& exe_dir) {
+    ResolveResult rr = resolve_existing(arg, cwd, exe_dir);
+
+    std::error_code ec;
+    if (rr.found && fs::is_directory(rr.path, ec) && !ec) {
+        ResolveResult as_dir = resolve_existing(rr.path / "input.txt", cwd, exe_dir);
+        as_dir.tried.insert(as_dir.tried.begin(), rr.tried.begin(), rr.tried.end());
+        return as_dir;
+    }
+
+    if (rr.found) return rr;
+
+    // Also support passing a directory that is not found by the generic resolver first.
+    // This is only a fallback; if --in is a file, the file path is used directly.
+    ResolveResult dir_rr;
+    std::vector<fs::path> tries;
+    if (arg.is_absolute()) {
+        tries.push_back(arg / "input.txt");
+    }
+    else {
+        tries.push_back(cwd / arg / "input.txt");
+        tries.push_back(exe_dir / arg / "input.txt");
+        tries.push_back(exe_dir.parent_path() / arg / "input.txt");
+        tries.push_back(exe_dir.parent_path().parent_path() / arg / "input.txt");
+    }
+
+    dir_rr.tried = rr.tried;
+    dir_rr.tried.insert(dir_rr.tried.end(), tries.begin(), tries.end());
+
+    for (const auto& t : tries) {
+        if (fs::exists(t, ec) && !ec) {
+            dir_rr.path = t;
+            dir_rr.found = true;
+            return dir_rr;
+        }
+        ec.clear();
+    }
+
+    dir_rr.path = arg;
+    return dir_rr;
 }
 
 static fs::path make_output_path(const fs::path& p, const fs::path& cwd) {
     if (p.empty()) return p;
     if (p.is_absolute()) return p;
-    return cwd / p; // удобно: всё выходит в корень проекта, если запуск из bin
+    return cwd / p;
+}
+
+static fs::path make_queries_output_path(const std::string& queries_arg,
+    const fs::path& coordinate_input_path,
+    const fs::path& cwd) {
+    if (queries_arg.empty()) {
+        return coordinate_input_path.parent_path() / "queries.txt";
+    }
+
+    fs::path q = make_output_path(fs::path(queries_arg), cwd);
+
+    std::error_code ec;
+    if (fs::exists(q, ec) && !ec && fs::is_directory(q, ec) && !ec) {
+        return q / "queries.txt";
+    }
+
+    if (q.filename().empty()) {
+        return q / "queries.txt";
+    }
+
+    return q;
 }
 
 static void print_not_found(const char* label, const ResolveResult& rr) {
@@ -110,9 +157,42 @@ static void print_not_found(const char* label, const ResolveResult& rr) {
     }
 }
 
-int main(int argc, char** argv) {
-    //enable_utf8_console();
+static bool ensure_parent_directory(const fs::path& file_path) {
+    const fs::path parent = file_path.parent_path();
+    if (parent.empty()) return true;
 
+    std::error_code ec;
+    fs::create_directories(parent, ec);
+    return !ec;
+}
+
+static fs::path find_id_map_csv(const fs::path& graph_path,
+    const fs::path& coordinate_input_path,
+    const fs::path& queries_path,
+    const fs::path& cwd,
+    const fs::path& exe_dir,
+    std::vector<fs::path>& candidates) {
+    candidates = {
+        graph_path.parent_path() / "id_map.csv",
+        coordinate_input_path.parent_path() / "id_map.csv",
+        queries_path.parent_path() / "id_map.csv",
+        cwd / "id_map.csv",
+        exe_dir / "id_map.csv",
+        exe_dir.parent_path() / "id_map.csv",
+        exe_dir.parent_path().parent_path() / "id_map.csv"
+    };
+
+    std::error_code ec;
+    for (const auto& candidate : candidates) {
+        if (!candidate.empty() && fs::exists(candidate, ec) && !ec) {
+            return candidate;
+        }
+        ec.clear();
+    }
+    return {};
+}
+
+int main(int argc, char** argv) {
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -122,6 +202,7 @@ int main(int argc, char** argv) {
 
     std::error_code ec;
     const fs::path cwd = fs::current_path(ec);
+    ec.clear();
     const fs::path exe_dir = fs::absolute(argv[0], ec).parent_path();
 
     // ---------------- osm-info ----------------
@@ -141,7 +222,7 @@ int main(int argc, char** argv) {
 
         auto rr = resolve_existing(pbf, cwd, exe_dir);
         std::cerr << "cwd: " << cwd.string() << "\n";
-        std::cerr << "exe: " << (exe_dir / "graph_builder.exe").string() << "\n";
+        std::cerr << "exe dir: " << exe_dir.string() << "\n";
 
         if (!rr.found) {
             print_not_found("PBF", rr);
@@ -198,6 +279,15 @@ int main(int argc, char** argv) {
         const fs::path out_bin_path = make_output_path(out_bin, cwd);
         const fs::path out_map_path = out_map.empty() ? fs::path{} : make_output_path(out_map, cwd);
 
+        if (!ensure_parent_directory(out_bin_path)) {
+            std::cerr << "Cannot create output directory for: " << out_bin_path.string() << "\n";
+            return 1;
+        }
+        if (!out_map_path.empty() && !ensure_parent_directory(out_map_path)) {
+            std::cerr << "Cannot create map output directory for: " << out_map_path.string() << "\n";
+            return 1;
+        }
+
         std::cerr << "cwd: " << cwd.string() << "\n";
         std::cerr << "pbf: " << pbf_rr.path.string() << "\n";
         std::cerr << "out: " << out_bin_path.string() << "\n";
@@ -218,14 +308,15 @@ int main(int argc, char** argv) {
 
     // ---------------- search ----------------
     if (cmd == "search") {
-        std::string graph, in, out;
+        std::string graph, input_txt, queries_arg, out;
         bool full = false;
         SearchMetric metric = SearchMetric::Distance;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--graph") graph = take_value(i, argc, argv);
-            else if (a == "--in") in = take_value(i, argc, argv);
+            else if (a == "--in") input_txt = take_value(i, argc, argv);
+            else if (a == "--queries") queries_arg = take_value(i, argc, argv);
             else if (a == "--out") out = take_value(i, argc, argv);
             else if (a == "--full") full = true;
             else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
@@ -237,52 +328,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (graph.empty() || in.empty() || out.empty()) {
+        if (graph.empty() || input_txt.empty() || out.empty()) {
             usage(argv[0]);
             return 1;
         }
-
-        fs::path in_path(in);
-        fs::path in_dir = in_path.parent_path();
-        fs::path input_txt_path = in_dir / "input.txt";
-
-        std::error_code ec;
-        if (!fs::exists(input_txt_path, ec)) {
-            std::cerr << "\nERROR: input.txt not found at: " << input_txt_path.string() << "\n";
-            std::cerr << "Please create input.txt with coordinates in format:\n";
-            std::cerr << "  lat1 lon1 lat2 lon2\n";
-            std::cerr << "Example:\n";
-            std::cerr << "  57.2834 34.8924 57.3558 34.8520\n";
-            return 1;
-        }
-
-        // Ищем id_map.csv
-        fs::path map_csv_path = exe_dir / "id_map.csv";
-        if (!fs::exists(map_csv_path, ec)) {
-            map_csv_path = cwd / "id_map.csv";
-        }
-
-        if (!fs::exists(map_csv_path, ec)) {
-            std::cerr << "\nERROR: id_map.csv not found\n";
-            std::cerr << "Expected locations:\n";
-            std::cerr << "  - " << (exe_dir / "id_map.csv").string() << "\n";
-            std::cerr << "  - " << (cwd / "id_map.csv").string() << "\n";
-            return 1;
-        }
-
-        std::cerr << "Found input.txt, converting coordinates to IDs..." << std::endl;
-        std::cerr << "Using map: " << map_csv_path.string() << std::endl;
-
-        std::string err;
-        if (!convert_coordinates_to_ids(map_csv_path.string(),
-            input_txt_path.string(),
-            in_path.string(),
-            err)) {
-            std::cerr << "\nERROR: Conversion failed: " << err << "\n";
-            return 1;
-        }
-
-        std::cerr << "Successfully converted coordinates to " << in_path.string() << std::endl;
 
         auto graph_rr = resolve_existing(graph, cwd, exe_dir);
         if (!graph_rr.found) {
@@ -291,51 +340,103 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        auto in_rr = resolve_existing(in, cwd, exe_dir);
-        if (!in_rr.found) {
+        // Important: --in is resolved as the actual coordinate input file.
+        // There is no "parent_path()/input.txt" substitution here.
+        auto input_rr = resolve_input_txt(input_txt, cwd, exe_dir);
+        if (!input_rr.found) {
             std::cerr << "cwd: " << cwd.string() << "\n";
-            print_not_found("Input", in_rr);
+            print_not_found("Input", input_rr);
+            std::cerr << "\nExpected coordinate input format:\n";
+            std::cerr << "  lat1 lon1 lat2 lon2\n";
+            std::cerr << "Example:\n";
+            std::cerr << "  57.2834 34.8924 57.3558 34.8520\n";
             return 1;
         }
 
+        const fs::path queries_path = make_queries_output_path(queries_arg, input_rr.path, cwd);
         const fs::path out_path = make_output_path(out, cwd);
 
-        std::cerr << "cwd: " << cwd.string() << "\n";
-        std::cerr << "graph: " << graph_rr.path.string() << "\n";
-        std::cerr << "in:    " << in_rr.path.string() << "\n";
-        std::cerr << "out:   " << out_path.string() << "\n";
+        if (!ensure_parent_directory(queries_path)) {
+            std::cerr << "Cannot create queries output directory for: " << queries_path.string() << "\n";
+            return 1;
+        }
+        if (!ensure_parent_directory(out_path)) {
+            std::cerr << "Cannot create result output directory for: " << out_path.string() << "\n";
+            return 1;
+        }
 
-        FILE* gf = fopen(graph_rr.path.string().c_str(), "rb");
+        std::vector<fs::path> map_candidates;
+        const fs::path map_csv_path = find_id_map_csv(graph_rr.path,
+            input_rr.path,
+            queries_path,
+            cwd,
+            exe_dir,
+            map_candidates);
+        if (map_csv_path.empty()) {
+            std::cerr << "\nERROR: id_map.csv not found\n";
+            std::cerr << "Expected locations:\n";
+            for (const auto& candidate : map_candidates) {
+                std::cerr << "  - " << candidate.string() << "\n";
+            }
+            return 1;
+        }
+
+        std::cerr << "cwd:     " << cwd.string() << "\n";
+        std::cerr << "graph:   " << graph_rr.path.string() << "\n";
+        std::cerr << "input:   " << input_rr.path.string() << "\n";
+        std::cerr << "map:     " << map_csv_path.string() << "\n";
+        std::cerr << "queries: " << queries_path.string() << "\n";
+        std::cerr << "out:     " << out_path.string() << "\n";
+
+        std::string err;
+        std::cerr << "Converting coordinates from input.txt to dense node-id queries...\n";
+        if (!convert_coordinates_to_ids(map_csv_path.string(),
+            input_rr.path.string(),
+            queries_path.string(),
+            err)) {
+            std::cerr << "\nERROR: Conversion failed: " << err << "\n";
+            return 1;
+        }
+
+        std::error_code exists_ec;
+        if (!fs::exists(queries_path, exists_ec) || exists_ec) {
+            std::cerr << "\nERROR: generated queries.txt not found at: " << queries_path.string() << "\n";
+            return 1;
+        }
+
+        FILE* gf = std::fopen(graph_rr.path.string().c_str(), "rb");
         if (!gf) {
             std::cerr << "Can't open graph: " << graph_rr.path.string() << "\n";
             return 1;
         }
 
-        FILE* inf = fopen(in_rr.path.string().c_str(), "r");
+        // Important: run_search reads exactly the generated queries_path.
+        FILE* inf = std::fopen(queries_path.string().c_str(), "r");
         if (!inf) {
-            std::cerr << "Can't open input: " << in_rr.path.string() << "\n";
-            fclose(gf);
+            std::cerr << "Can't open generated queries: " << queries_path.string() << "\n";
+            std::fclose(gf);
             return 1;
         }
 
-        FILE* outf = fopen(out_path.string().c_str(), "w");
+        FILE* outf = std::fopen(out_path.string().c_str(), "w");
         if (!outf) {
             std::cerr << "Can't open output: " << out_path.string() << "\n";
-            fclose(gf);
-            fclose(inf);
+            std::fclose(gf);
+            std::fclose(inf);
             return 1;
         }
 
         run_search(gf, inf, outf, full, metric);
 
-        fclose(outf);
-        fclose(inf);
-        fclose(gf);
+        std::fclose(outf);
+        std::fclose(inf);
+        std::fclose(gf);
 
         std::cout << "Search OK\n";
         return 0;
     }
-    
+
+    // ---------------- visualize ----------------
     if (cmd == "visualize") {
         std::string graph, result_txt;
         for (int i = 2; i < argc; ++i) {
@@ -344,13 +445,16 @@ int main(int argc, char** argv) {
             else if (a == "--result") result_txt = take_value(i, argc, argv);
             else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         }
+
         if (graph.empty()) {
-            usage(argv[0]); return 1;
+            usage(argv[0]);
+            return 1;
         }
 
         auto graph_rr = resolve_existing(graph, cwd, exe_dir);
         if (!graph_rr.found) {
-            print_not_found("Graph", graph_rr); return 1;
+            print_not_found("Graph", graph_rr);
+            return 1;
         }
 
         GraphVisualizer viz;
@@ -362,13 +466,22 @@ int main(int argc, char** argv) {
                 std::vector<Route> loaded;
                 load_routes_from_file(res_rr.path.string(), loaded);
                 for (auto& r : loaded) viz.add_route(r);
+                std::cerr << "Loaded routes: " << loaded.size() << "\n";
+            }
+            else {
+                print_not_found("Result", res_rr);
+                std::cerr << "Continuing in map-only mode.\n";
             }
         }
+        else {
+            std::cerr << "No --result specified; drawing map only.\n";
+        }
 
-        std::cout << "Запуск визуализатора...\n";
+        std::cout << "Starting visualizer...\n";
         viz.run();
         return 0;
     }
+
     usage(argv[0]);
     return 1;
 }

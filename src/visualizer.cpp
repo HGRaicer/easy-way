@@ -1,13 +1,16 @@
 ﻿#include "visualizer.hpp"
 
+#include <QtCore/QLineF>
 #include <QtCore/QRectF>
 #include <QtCore/QSizeF>
+#include <QtCore/QVector>
 #include <QtCore/QString>
 #include <QtGui/QColor>
 #include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPen>
+#include <QtGui/QPixmap>
 #include <QtGui/QWheelEvent>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QWidget>
@@ -20,6 +23,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -144,11 +148,12 @@ class QtGraphWidget final : public QWidget {
 public:
     explicit QtGraphWidget(const GraphVisualizer& visualizer, QWidget* parent = nullptr)
         : QWidget(parent), viz_(visualizer) {
-        setWindowTitle("OSM Route Visualizer - Qt");
+        setWindowTitle(viz_.routes.empty() ? "OSM Map Visualizer - Qt" : "OSM Route Visualizer - Qt");
         resize(1600, 1000);
         setMouseTracking(true);
         setFocusPolicy(Qt::StrongFocus);
         build_route_index();
+        build_road_tile_index();
     }
 
 protected:
@@ -198,14 +203,16 @@ protected:
         const QPointF before = screen_to_world(cursor);
         const double factor = std::pow(1.0015, event->angleDelta().y());
         zoom_ = std::clamp(zoom_ * factor, kMinZoom, kMaxZoom);
+        clear_road_tile_cache();
         const QPointF after = screen_to_world(cursor);
         center_ += before - after;
         update();
     }
 
     void keyPressEvent(QKeyEvent* event) override {
-        if (event->key() == Qt::Key_R) {
+        if (is_reset_view_key(event)) {
             initialized_ = false;
+            clear_road_tile_cache();
             update();
             return;
         }
@@ -214,7 +221,73 @@ protected:
     }
 
 private:
+    bool is_reset_view_key(const QKeyEvent* event) const {
+        if (!event) return false;
+
+        // Qt::Key_R works only when the active keyboard layout produces Latin R.
+        // With the Russian layout the same physical key produces Cyrillic "к".
+        if (event->key() == Qt::Key_R) return true;
+
+        const QString text = event->text();
+        if (text.compare(QString::fromUtf8("r"), Qt::CaseInsensitive) == 0) return true;
+        if (text.compare(QString::fromUtf8("к"), Qt::CaseInsensitive) == 0) return true;
+
+        // Physical R key on common Windows/Linux keyboard scan-code sets.
+        // This keeps reset independent from the selected input language.
+        return event->nativeScanCode() == 0x13;
+    }
+
     static constexpr std::uint64_t kMaxVisibleRoadsBeforeFiltering = 500000;
+    static constexpr std::uint64_t kMaxRoadsPerFrame = 120000;
+    static constexpr int kRoadLineBatchSize = 8192;
+    static constexpr int kRasterTilePixels = 512;
+    static constexpr std::size_t kMaxCachedRasterTiles = 256;
+
+    struct RoadEdgeItem {
+        std::uint32_t u = 0;
+        std::uint32_t v = 0;
+        float speed_mps = 0.0f;
+        std::uint8_t tier = 0; // 0: all/unknown, 1: >=30, 2: >=50, 3: >=70, 4: >=90 km/h
+    };
+
+    struct RoadTileLevel {
+        int cols = 0;
+        int rows = 0;
+        double tile_size = 0.0;
+        int min_tier = 0;
+        const char* name = "";
+        std::vector<std::vector<std::uint32_t>> tiles;
+    };
+
+    struct RasterTileKey {
+        int level = 0;
+        int x = 0;
+        int y = 0;
+
+        bool operator==(const RasterTileKey& other) const noexcept {
+            return level == other.level && x == other.x && y == other.y;
+        }
+    };
+
+    struct RasterTileKeyHash {
+        std::size_t operator()(const RasterTileKey& key) const noexcept {
+            std::uint64_t h = 1469598103934665603ull;
+            auto mix = [&h](int value) {
+                h ^= static_cast<std::uint32_t>(value);
+                h *= 1099511628211ull;
+                };
+            mix(key.level);
+            mix(key.x);
+            mix(key.y);
+            return static_cast<std::size_t>(h);
+        }
+    };
+
+    struct CachedRoadRasterTile {
+        QPixmap pixmap;
+        std::uint64_t roads_drawn = 0;
+        int last_used_frame = 0;
+    };
 
     const GraphVisualizer& viz_;
 
@@ -225,11 +298,17 @@ private:
     QPointF last_mouse_{ 0.0, 0.0 };
 
     std::unordered_map<std::uint64_t, std::vector<std::size_t>> route_edge_routes_;
+    std::vector<RoadEdgeItem> road_edges_;
+    std::array<std::vector<std::vector<std::uint32_t>>, 5> road_edge_grid_; // legacy grid, kept unused
+    std::array<RoadTileLevel, 5> road_tile_levels_;
+    std::unordered_map<RasterTileKey, CachedRoadRasterTile, RasterTileKeyHash> road_raster_tile_cache_;
+    int road_raster_frame_ = 0;
 
     std::uint64_t last_drawn_roads_ = 0;
     std::uint64_t last_candidate_roads_ = 0;
     std::uint64_t last_total_visible_roads_ = 0;
     int last_min_speed_kph_ = 0;
+    int last_tile_level_ = 0;
 
     QPointF world_to_screen(const GraphVisualizer::WorldPoint& p) const {
         return QPointF(width() * 0.5 + (p.x - center_.x()) * zoom_,
@@ -251,13 +330,38 @@ private:
         );
     }
 
+    bool first_route_start_point(QPointF& out) const {
+        for (const Route& route : viz_.routes) {
+            if (!route.visible) continue;
+
+            for (std::uint32_t node : route.nodes) {
+                if (node >= viz_.graph.N) continue;
+
+                const auto& p = viz_.world_coords[node];
+                out = QPointF(p.x, p.y);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void ensure_initial_view() {
         if (initialized_) return;
 
-        QRectF bounds = route_world_bounds();
-        if (!bounds.isValid() || bounds.isEmpty()) {
-            bounds = QRectF(QPointF(viz_.min_x, viz_.min_y), QPointF(viz_.max_x, viz_.max_y));
+        QPointF route_start;
+        if (first_route_start_point(route_start)) {
+            center_ = route_start;
+
+            // Start at the first point of the first loaded route, not at the
+            // whole-route bounding box.  This keeps the user focused on where
+            // the route begins while still allowing R to refit later.
+            zoom_ = std::clamp(180000.0, kMinZoom, kMaxZoom);
+            initialized_ = true;
+            return;
         }
+
+        QRectF bounds = QRectF(QPointF(viz_.min_x, viz_.min_y), QPointF(viz_.max_x, viz_.max_y));
 
         if (!bounds.isValid() || bounds.width() <= 0.0 || bounds.height() <= 0.0) {
             center_ = QPointF(0.0, 0.0);
@@ -366,6 +470,294 @@ private:
         return gx1 <= gx2 && gy1 <= gy2;
     }
 
+
+    std::uint8_t road_tier_for_speed(float speed_mps) const {
+        if (!viz_.graph.speed_present || speed_mps <= 0.0f) return 0;
+
+        const float speed_kph = speed_mps * 3.6f;
+        if (speed_kph >= 90.0f) return 4;
+        if (speed_kph >= 70.0f) return 3;
+        if (speed_kph >= 50.0f) return 2;
+        if (speed_kph >= 30.0f) return 1;
+        return 0;
+    }
+
+    int min_kph_for_tier(int tier) const {
+        if (tier >= 4) return 90;
+        if (tier >= 3) return 70;
+        if (tier >= 2) return 50;
+        if (tier >= 1) return 30;
+        return 0;
+    }
+
+    int base_road_tier_for_zoom() const {
+        if (!viz_.graph.speed_present) return 0;
+
+        // Far zoom levels must not even iterate over local streets.
+        // The exact numbers are intentionally conservative and can be tuned
+        // from the overlay by watching Zoom / Roads drawn.
+        if (zoom_ < 6000.0) return 4;    // only highways / very fast roads
+        if (zoom_ < 14000.0) return 3;   // >=70 km/h
+        if (zoom_ < 35000.0) return 2;   // >=50 km/h
+        if (zoom_ < 90000.0) return 1;   // >=30 km/h
+        return 0;
+    }
+
+    int tile_level_for_zoom() const {
+        if (!viz_.graph.speed_present) return 4;
+
+        // One global LOD is selected for the whole frame. Do not change it per
+        // row/tile/candidate count; otherwise the top and bottom of the screen
+        // can show different map layers.
+        if (zoom_ < 6000.0) return 0;    // only very fast roads
+        if (zoom_ < 14000.0) return 1;   // >=70 km/h
+        if (zoom_ < 35000.0) return 2;   // >=50 km/h
+        if (zoom_ < 90000.0) return 3;   // >=30 km/h
+        return 4;                        // all roads
+    }
+
+    QColor road_color_for_tier(int tier) const {
+        if (tier >= 4) return QColor(126, 130, 140);
+        if (tier >= 3) return QColor(108, 112, 122);
+        if (tier >= 2) return QColor(92, 96, 106);
+        if (tier >= 1) return QColor(72, 76, 86);
+        return QColor(55, 58, 67);
+    }
+
+    double road_width_for_tier(int tier) const {
+        if (tier >= 4) return 1.35;
+        if (tier >= 3) return 1.15;
+        if (tier >= 2) return 0.95;
+        if (tier >= 1) return 0.78;
+        return 0.62;
+    }
+
+    void init_road_tile_levels() {
+        const double width = std::max(1e-9, viz_.max_x - viz_.min_x);
+        const double height = std::max(1e-9, viz_.max_y - viz_.min_y);
+        const double max_dim = std::max(width, height);
+
+        struct LevelDef {
+            int tiles_on_max_axis;
+            int min_tier;
+            const char* name;
+        };
+
+        const std::array<LevelDef, 5> defs = { {
+            { 16, 4, "z0 highways" },
+            { 32, 3, "z1 major" },
+            { 64, 2, "z2 primary" },
+            {128, 1, "z3 regional" },
+            {256, 0, "z4 all" }
+        } };
+
+        for (std::size_t i = 0; i < road_tile_levels_.size(); ++i) {
+            RoadTileLevel& level = road_tile_levels_[i];
+            level.tile_size = std::max(max_dim / static_cast<double>(defs[i].tiles_on_max_axis), 1e-9);
+            level.cols = std::max(1, static_cast<int>(std::ceil(width / level.tile_size)) + 1);
+            level.rows = std::max(1, static_cast<int>(std::ceil(height / level.tile_size)) + 1);
+            level.min_tier = defs[i].min_tier;
+            level.name = defs[i].name;
+            level.tiles.clear();
+            level.tiles.resize(static_cast<std::size_t>(level.cols) * static_cast<std::size_t>(level.rows));
+        }
+    }
+
+    void add_edge_to_tile_level(int level_index, std::uint32_t edge_index) {
+        if (level_index < 0 || level_index >= static_cast<int>(road_tile_levels_.size())) return;
+        if (edge_index >= road_edges_.size()) return;
+
+        RoadTileLevel& level = road_tile_levels_[static_cast<std::size_t>(level_index)];
+        if (level.tiles.empty() || level.tile_size <= 0.0 || level.cols <= 0 || level.rows <= 0) return;
+
+        const RoadEdgeItem& edge = road_edges_[edge_index];
+        const auto& a = viz_.world_coords[edge.u];
+        const auto& b = viz_.world_coords[edge.v];
+
+        const double x1 = std::min(a.x, b.x);
+        const double x2 = std::max(a.x, b.x);
+        const double y1 = std::min(a.y, b.y);
+        const double y2 = std::max(a.y, b.y);
+
+        const int gx1 = std::clamp(static_cast<int>(std::floor((x1 - viz_.min_x) / level.tile_size)), 0, level.cols - 1);
+        const int gx2 = std::clamp(static_cast<int>(std::floor((x2 - viz_.min_x) / level.tile_size)), 0, level.cols - 1);
+        const int gy1 = std::clamp(static_cast<int>(std::floor((y1 - viz_.min_y) / level.tile_size)), 0, level.rows - 1);
+        const int gy2 = std::clamp(static_cast<int>(std::floor((y2 - viz_.min_y) / level.tile_size)), 0, level.rows - 1);
+
+        for (int gy = gy1; gy <= gy2; ++gy) {
+            for (int gx = gx1; gx <= gx2; ++gx) {
+                const std::size_t tile = static_cast<std::size_t>(gy) * static_cast<std::size_t>(level.cols) +
+                    static_cast<std::size_t>(gx);
+                level.tiles[tile].push_back(edge_index);
+            }
+        }
+    }
+
+    void build_road_tile_index() {
+        road_edges_.clear();
+        init_road_tile_levels();
+
+        if (viz_.graph.N == 0 || viz_.graph.offsets.empty()) return;
+
+        std::unordered_set<std::uint64_t> seen_edges;
+        seen_edges.reserve(viz_.graph.adjacency.size());
+        road_edges_.reserve(viz_.graph.adjacency.size() / 2 + 1);
+
+        for (std::uint32_t u = 0; u < viz_.graph.N; ++u) {
+            const std::uint32_t start = (u == 0 ? 0u : viz_.graph.offsets[u - 1]);
+            const std::uint32_t end = viz_.graph.offsets[u];
+
+            for (std::uint32_t i = start; i < end && i < viz_.graph.adjacency.size(); ++i) {
+                const std::uint32_t v = viz_.graph.adjacency[i];
+                if (v >= viz_.graph.N || u == v) continue;
+
+                const std::uint64_t key = make_edge_key(u, v);
+                if (!seen_edges.insert(key).second) continue;
+
+                const float speed = edge_speed(i);
+                const std::uint8_t tier = road_tier_for_speed(speed);
+                const std::uint32_t edge_index = static_cast<std::uint32_t>(road_edges_.size());
+                road_edges_.push_back(RoadEdgeItem{ u, v, speed, tier });
+
+                for (int level_index = 0; level_index < static_cast<int>(road_tile_levels_.size()); ++level_index) {
+                    if (tier < road_tile_levels_[static_cast<std::size_t>(level_index)].min_tier) continue;
+                    add_edge_to_tile_level(level_index, edge_index);
+                }
+            }
+        }
+    }
+
+    bool tile_range_for_view(const QRectF& view, const RoadTileLevel& level,
+        int& gx1, int& gx2, int& gy1, int& gy2) const {
+        if (level.tiles.empty() || level.tile_size <= 0.0 || level.cols <= 0 || level.rows <= 0) return false;
+
+        gx1 = static_cast<int>(std::floor((view.left() - viz_.min_x) / level.tile_size));
+        gx2 = static_cast<int>(std::floor((view.right() - viz_.min_x) / level.tile_size));
+        gy1 = static_cast<int>(std::floor((view.top() - viz_.min_y) / level.tile_size));
+        gy2 = static_cast<int>(std::floor((view.bottom() - viz_.min_y) / level.tile_size));
+
+        gx1 = std::clamp(gx1, 0, level.cols - 1);
+        gx2 = std::clamp(gx2, 0, level.cols - 1);
+        gy1 = std::clamp(gy1, 0, level.rows - 1);
+        gy2 = std::clamp(gy2, 0, level.rows - 1);
+
+        return gx1 <= gx2 && gy1 <= gy2;
+    }
+
+    void build_road_lod_index() {
+        road_edges_.clear();
+
+        const std::size_t cell_count = static_cast<std::size_t>(viz_.grid_cols) *
+            static_cast<std::size_t>(viz_.grid_rows);
+
+        for (auto& tier_grid : road_edge_grid_) {
+            tier_grid.clear();
+            tier_grid.resize(cell_count);
+        }
+
+        if (viz_.graph.N == 0 || viz_.graph.offsets.empty() || viz_.cell_size <= 0.0 || cell_count == 0) {
+            return;
+        }
+
+        std::unordered_set<std::uint64_t> seen_edges;
+        seen_edges.reserve(viz_.graph.adjacency.size());
+        road_edges_.reserve(viz_.graph.adjacency.size() / 2 + 1);
+
+        for (std::uint32_t u = 0; u < viz_.graph.N; ++u) {
+            const std::uint32_t start = (u == 0 ? 0u : viz_.graph.offsets[u - 1]);
+            const std::uint32_t end = viz_.graph.offsets[u];
+
+            for (std::uint32_t i = start; i < end && i < viz_.graph.adjacency.size(); ++i) {
+                const std::uint32_t v = viz_.graph.adjacency[i];
+                if (v >= viz_.graph.N || u == v) continue;
+
+                // For map drawing, direction does not matter. Road graphs often
+                // contain both u->v and v->u; drawing both halves costs FPS with no visual gain.
+                const std::uint64_t key = make_edge_key(u, v);
+                if (!seen_edges.insert(key).second) continue;
+
+                const float speed = edge_speed(i);
+                const std::uint8_t tier = road_tier_for_speed(speed);
+                const std::uint32_t edge_index = static_cast<std::uint32_t>(road_edges_.size());
+                road_edges_.push_back(RoadEdgeItem{ u, v, speed, tier });
+
+                const auto& a = viz_.world_coords[u];
+                const auto& b = viz_.world_coords[v];
+
+                // Important: index a road into every spatial cell touched by its bbox,
+                // not just by the midpoint. Midpoint-only indexing causes roads to break
+                // near viewport/cell boundaries.
+                const double x1 = std::min(a.x, b.x);
+                const double x2 = std::max(a.x, b.x);
+                const double y1 = std::min(a.y, b.y);
+                const double y2 = std::max(a.y, b.y);
+
+                const int gx1 = std::clamp(static_cast<int>(std::floor((x1 - viz_.min_x) / viz_.cell_size)), 0, viz_.grid_cols - 1);
+                const int gx2 = std::clamp(static_cast<int>(std::floor((x2 - viz_.min_x) / viz_.cell_size)), 0, viz_.grid_cols - 1);
+                const int gy1 = std::clamp(static_cast<int>(std::floor((y1 - viz_.min_y) / viz_.cell_size)), 0, viz_.grid_rows - 1);
+                const int gy2 = std::clamp(static_cast<int>(std::floor((y2 - viz_.min_y) / viz_.cell_size)), 0, viz_.grid_rows - 1);
+
+                for (int gy = gy1; gy <= gy2; ++gy) {
+                    for (int gx = gx1; gx <= gx2; ++gx) {
+                        const std::size_t cell = static_cast<std::size_t>(gy) * static_cast<std::size_t>(viz_.grid_cols) +
+                            static_cast<std::size_t>(gx);
+                        road_edge_grid_[tier][cell].push_back(edge_index);
+                    }
+                }
+            }
+        }
+    }
+
+    std::uint64_t estimate_indexed_roads(const QRectF& view, int min_tier) const {
+        int gx1 = 0, gx2 = 0, gy1 = 0, gy2 = 0;
+        if (!grid_range_for_view(view, gx1, gx2, gy1, gy2)) return 0;
+
+        std::uint64_t count = 0;
+        const int tier_start = std::clamp(min_tier, 0, 4);
+
+        for (int gy = gy1; gy <= gy2; ++gy) {
+            for (int gx = gx1; gx <= gx2; ++gx) {
+                const std::size_t cell = static_cast<std::size_t>(gy) * static_cast<std::size_t>(viz_.grid_cols) +
+                    static_cast<std::size_t>(gx);
+
+                for (int tier = tier_start; tier <= 4; ++tier) {
+                    if (cell < road_edge_grid_[tier].size()) {
+                        count += static_cast<std::uint64_t>(road_edge_grid_[tier][cell].size());
+                    }
+                }
+            }
+        }
+
+        return count;
+    }
+
+    int choose_road_tier_for_view(const QRectF& view) const {
+        int tier = base_road_tier_for_zoom();
+
+        // If a dense city is still too heavy at this zoom, raise the LOD until
+        // the number of candidate segments is bounded.
+        while (tier < 4 && estimate_indexed_roads(view, tier) > kMaxVisibleRoadsBeforeFiltering) {
+            ++tier;
+        }
+
+        return tier;
+    }
+
+    bool road_too_short_on_screen(const RoadEdgeItem& e, double min_px) const {
+        const auto& a = viz_.world_coords[e.u];
+        const auto& b = viz_.world_coords[e.v];
+        const double dx = (a.x - b.x) * zoom_;
+        const double dy = (a.y - b.y) * zoom_;
+        return dx * dx + dy * dy < min_px * min_px;
+    }
+
+    void flush_road_lines(QPainter& painter, QVector<QLineF>& lines) {
+        if (lines.isEmpty()) return;
+        painter.drawLines(lines.constData(), static_cast<int>(lines.size()));
+        last_drawn_roads_ += static_cast<std::uint64_t>(lines.size());
+        lines.clear();
+    }
+
     RoadCountStats count_visible_roads_by_speed(const QRectF& view) const {
         RoadCountStats stats;
 
@@ -444,38 +836,213 @@ private:
         }
     }
 
+    void clear_road_tile_cache() {
+        road_raster_tile_cache_.clear();
+    }
+
+    bool raster_tile_range_for_view(const QRectF& view, int& tx1, int& tx2, int& ty1, int& ty2) const {
+        if (zoom_ <= 0.0) return false;
+
+        const double map_width = std::max(0.0, viz_.max_x - viz_.min_x);
+        const double map_height = std::max(0.0, viz_.max_y - viz_.min_y);
+        const double max_px_x = map_width * zoom_;
+        const double max_px_y = map_height * zoom_;
+        if (max_px_x <= 0.0 || max_px_y <= 0.0) return false;
+
+        const double left_px = (view.left() - viz_.min_x) * zoom_;
+        const double right_px = (view.right() - viz_.min_x) * zoom_;
+        const double top_px = (view.top() - viz_.min_y) * zoom_;
+        const double bottom_px = (view.bottom() - viz_.min_y) * zoom_;
+
+        if (right_px < 0.0 || left_px > max_px_x || bottom_px < 0.0 || top_px > max_px_y) {
+            return false;
+        }
+
+        const int max_tx = std::max(0, static_cast<int>(std::ceil(max_px_x / static_cast<double>(kRasterTilePixels))) - 1);
+        const int max_ty = std::max(0, static_cast<int>(std::ceil(max_px_y / static_cast<double>(kRasterTilePixels))) - 1);
+
+        tx1 = std::clamp(static_cast<int>(std::floor(left_px / static_cast<double>(kRasterTilePixels))), 0, max_tx);
+        tx2 = std::clamp(static_cast<int>(std::floor(right_px / static_cast<double>(kRasterTilePixels))), 0, max_tx);
+        ty1 = std::clamp(static_cast<int>(std::floor(top_px / static_cast<double>(kRasterTilePixels))), 0, max_ty);
+        ty2 = std::clamp(static_cast<int>(std::floor(bottom_px / static_cast<double>(kRasterTilePixels))), 0, max_ty);
+
+        return tx1 <= tx2 && ty1 <= ty2;
+    }
+
+    QRectF raster_tile_world_rect(int tx, int ty) const {
+        const double left = viz_.min_x + (static_cast<double>(tx) * static_cast<double>(kRasterTilePixels)) / zoom_;
+        const double top = viz_.min_y + (static_cast<double>(ty) * static_cast<double>(kRasterTilePixels)) / zoom_;
+        const double right = viz_.min_x + (static_cast<double>(tx + 1) * static_cast<double>(kRasterTilePixels)) / zoom_;
+        const double bottom = viz_.min_y + (static_cast<double>(ty + 1) * static_cast<double>(kRasterTilePixels)) / zoom_;
+        return QRectF(QPointF(left, top), QPointF(right, bottom));
+    }
+
+    QPointF world_to_raster_tile_local(const GraphVisualizer::WorldPoint& p, const QRectF& tile_world) const {
+        return QPointF(
+            (p.x - tile_world.left()) * zoom_,
+            (p.y - tile_world.top()) * zoom_
+        );
+    }
+
+    QPointF snap_to_pixel_center(const QPointF& p) const {
+        return QPointF(std::round(p.x()) + 0.5, std::round(p.y()) + 0.5);
+    }
+
+    CachedRoadRasterTile render_road_raster_tile(const RoadTileLevel& level, int level_index, int tx, int ty) {
+        CachedRoadRasterTile cached;
+        cached.pixmap = QPixmap(kRasterTilePixels, kRasterTilePixels);
+        cached.pixmap.fill(Qt::transparent);
+        cached.last_used_frame = road_raster_frame_;
+
+        const QRectF tile_world = raster_tile_world_rect(tx, ty);
+        const double pixel_pad = 3.0 / std::max(zoom_, 1.0);
+        const QRectF query_world = tile_world.adjusted(-pixel_pad, -pixel_pad, pixel_pad, pixel_pad);
+
+        int gx1 = 0, gx2 = 0, gy1 = 0, gy2 = 0;
+        if (!tile_range_for_view(query_world, level, gx1, gx2, gy1, gy2)) {
+            return cached;
+        }
+
+        std::array<QVector<QLineF>, 5> lines_by_tier;
+        for (QVector<QLineF>& lines : lines_by_tier) {
+            lines.reserve(kRoadLineBatchSize);
+        }
+
+        std::unordered_set<std::uint32_t> seen_edges;
+        seen_edges.reserve(4096);
+
+        for (int gy = gy1; gy <= gy2; ++gy) {
+            for (int gx = gx1; gx <= gx2; ++gx) {
+                const std::size_t vector_tile = static_cast<std::size_t>(gy) * static_cast<std::size_t>(level.cols) +
+                    static_cast<std::size_t>(gx);
+                if (vector_tile >= level.tiles.size()) continue;
+
+                const auto& tile_edges = level.tiles[vector_tile];
+                for (std::uint32_t edge_index : tile_edges) {
+                    if (edge_index >= road_edges_.size()) continue;
+                    if (!seen_edges.insert(edge_index).second) continue;
+
+                    const RoadEdgeItem& edge = road_edges_[edge_index];
+                    if (edge.tier < level.min_tier) continue;
+                    if (!edge_intersects_view(edge.u, edge.v, query_world)) continue;
+
+                    const int tier = std::clamp(static_cast<int>(edge.tier), 0, 4);
+                    lines_by_tier[static_cast<std::size_t>(tier)].push_back(QLineF(
+                        snap_to_pixel_center(world_to_raster_tile_local(viz_.world_coords[edge.u], tile_world)),
+                        snap_to_pixel_center(world_to_raster_tile_local(viz_.world_coords[edge.v], tile_world))
+                    ));
+                }
+            }
+        }
+
+        QPainter tile_painter(&cached.pixmap);
+        tile_painter.setRenderHint(QPainter::Antialiasing, false);
+        tile_painter.setBrush(Qt::NoBrush);
+        tile_painter.setClipRect(QRectF(0.0, 0.0,
+            static_cast<double>(kRasterTilePixels),
+            static_cast<double>(kRasterTilePixels)));
+
+        // Preserve the exact visual ordering from the direct vector renderer:
+        // weak roads first, important roads last.
+        for (int tier = level.min_tier; tier <= 4; ++tier) {
+            QVector<QLineF>& lines = lines_by_tier[static_cast<std::size_t>(tier)];
+            if (lines.isEmpty()) continue;
+
+            QPen pen(road_color_for_tier(tier));
+            pen.setWidthF(road_width_for_tier(tier));
+            pen.setCosmetic(true);
+            pen.setCapStyle(Qt::FlatCap);
+            pen.setJoinStyle(Qt::MiterJoin);
+            tile_painter.setPen(pen);
+
+            int offset = 0;
+            const int line_count = static_cast<int>(lines.size());
+            while (offset < line_count) {
+                const int count = std::min(kRoadLineBatchSize, line_count - offset);
+                tile_painter.drawLines(lines.constData() + offset, count);
+                cached.roads_drawn += static_cast<std::uint64_t>(count);
+                offset += count;
+            }
+        }
+
+        return cached;
+    }
+
+    CachedRoadRasterTile& get_road_raster_tile(const RoadTileLevel& level, int level_index, int tx, int ty) {
+        const RasterTileKey key{ level_index, tx, ty };
+        auto it = road_raster_tile_cache_.find(key);
+        if (it == road_raster_tile_cache_.end()) {
+            CachedRoadRasterTile cached = render_road_raster_tile(level, level_index, tx, ty);
+            it = road_raster_tile_cache_.emplace(key, std::move(cached)).first;
+        }
+
+        it->second.last_used_frame = road_raster_frame_;
+        return it->second;
+    }
+
+    void prune_road_tile_cache() {
+        if (road_raster_tile_cache_.size() <= kMaxCachedRasterTiles) return;
+
+        std::vector<std::pair<int, RasterTileKey>> by_age;
+        by_age.reserve(road_raster_tile_cache_.size());
+        for (const auto& kv : road_raster_tile_cache_) {
+            by_age.emplace_back(kv.second.last_used_frame, kv.first);
+        }
+
+        std::sort(by_age.begin(), by_age.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.first < rhs.first;
+            });
+
+        const std::size_t erase_count = road_raster_tile_cache_.size() - kMaxCachedRasterTiles;
+        for (std::size_t i = 0; i < erase_count && i < by_age.size(); ++i) {
+            road_raster_tile_cache_.erase(by_age[i].second);
+        }
+    }
+
     void draw_roads(QPainter& painter) {
         last_drawn_roads_ = 0;
         last_candidate_roads_ = 0;
         last_total_visible_roads_ = 0;
         last_min_speed_kph_ = 0;
+        last_tile_level_ = 0;
 
-        if (viz_.grid.empty() || viz_.cell_size <= 0.0) return;
+        if (road_edges_.empty()) return;
 
-        const QRectF view = visible_world_rect().adjusted(
-            -viz_.cell_size, -viz_.cell_size,
-            viz_.cell_size, viz_.cell_size
-        );
+        const int level_index = std::clamp(tile_level_for_zoom(), 0, static_cast<int>(road_tile_levels_.size()) - 1);
+        const RoadTileLevel& level = road_tile_levels_[static_cast<std::size_t>(level_index)];
+        if (level.tiles.empty()) return;
 
-        const RoadCountStats stats = count_visible_roads_by_speed(view);
-        const int min_kph = choose_min_speed_by_count(stats);
-        const std::uint64_t selected_count = count_for_min_speed(stats, min_kph);
+        last_tile_level_ = level_index;
+        last_min_speed_kph_ = min_kph_for_tier(level.min_tier);
 
-        last_min_speed_kph_ = min_kph;
-        last_candidate_roads_ = selected_count;
-        last_total_visible_roads_ = stats.all;
+        const QRectF view = visible_world_rect();
 
-        QPen pen(QColor(92, 94, 102));
-        if (min_kph >= 90) pen.setWidthF(1.25);
-        else if (min_kph >= 70) pen.setWidthF(1.10);
-        else if (min_kph >= 50) pen.setWidthF(1.00);
-        else if (min_kph >= 30) pen.setWidthF(0.90);
-        else pen.setWidthF(0.75);
-        pen.setCosmetic(true);
+        int tx1 = 0, tx2 = 0, ty1 = 0, ty2 = 0;
+        if (!raster_tile_range_for_view(view, tx1, tx2, ty1, ty2)) return;
 
-        painter.setPen(pen);
+        ++road_raster_frame_;
         painter.setRenderHint(QPainter::Antialiasing, false);
-        draw_visible_roads_with_filter(painter, view, min_kph);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+
+        for (int ty = ty1; ty <= ty2; ++ty) {
+            for (int tx = tx1; tx <= tx2; ++tx) {
+                CachedRoadRasterTile& cached = get_road_raster_tile(level, level_index, tx, ty);
+
+                const QRectF tile_world = raster_tile_world_rect(tx, ty);
+                const QPointF tile_screen = world_to_screen(GraphVisualizer::WorldPoint{
+                    tile_world.left(),
+                    tile_world.top()
+                    });
+
+                painter.drawPixmap(tile_screen, cached.pixmap);
+                last_drawn_roads_ += cached.roads_drawn;
+                last_total_visible_roads_ += cached.roads_drawn;
+                last_candidate_roads_ += cached.roads_drawn;
+            }
+        }
+
+        prune_road_tile_cache();
     }
 
     void build_route_index() {
@@ -563,6 +1130,8 @@ private:
     }
 
     void draw_routes(QPainter& painter) {
+        if (viz_.routes.empty()) return;
+
         painter.setRenderHint(QPainter::Antialiasing, true);
         painter.setBrush(Qt::NoBrush);
 
@@ -695,9 +1264,21 @@ private:
     void draw_overlay(QPainter& painter) {
         painter.setRenderHint(QPainter::Antialiasing, true);
 
+        constexpr int base_overlay_height = 112;
+        constexpr int route_row_height = 20;
+        constexpr std::size_t max_route_rows_in_overlay = 12;
+
+        const std::size_t route_count = viz_.routes.size();
+        const std::size_t route_rows = route_count == 0
+            ? 1
+            : std::min<std::size_t>(route_count, max_route_rows_in_overlay);
+        const bool routes_truncated = route_count > route_rows;
+        const int extra_rows = static_cast<int>(route_rows) + (routes_truncated ? 1 : 0);
+        const int overlay_height = base_overlay_height + extra_rows * route_row_height;
+
         painter.setPen(Qt::NoPen);
         painter.setBrush(QColor(0, 0, 0, 165));
-        painter.drawRoundedRect(QRectF(10, 10, 980, 132), 8, 8);
+        painter.drawRoundedRect(QRectF(10, 10, 980, overlay_height), 8, 8);
 
         painter.setPen(QColor(245, 245, 245));
 
@@ -716,41 +1297,53 @@ private:
             filter_text = QString("roads >= %1 km/h").arg(last_min_speed_kph_);
         }
 
+        const RoadTileLevel& overlay_level = road_tile_levels_[static_cast<std::size_t>(std::clamp(last_tile_level_, 0, 4))];
+
         painter.drawText(24, 58,
-            QString("Navigator mode: visible grid    Road filter: %1    visible: %2    selected: %3")
+            QString("Renderer: raster tile cache LOD %1 (%2)    Road layer: %3    cached segments: %4")
+            .arg(last_tile_level_)
+            .arg(overlay_level.name)
             .arg(filter_text)
             .arg(static_cast<qulonglong>(last_total_visible_roads_))
-            .arg(static_cast<qulonglong>(last_candidate_roads_))
         );
 
         painter.drawText(24, 82,
             "Mouse drag - pan | Wheel - zoom | R - fit route/map | shared routes use nested color bands"
         );
 
-        if (!viz_.routes.empty()) {
-            const Route& r = viz_.routes.front();
-            painter.drawText(24, 106,
-                QString("Routes: %1    First route: %2 nodes, distance %3 m, time %4 s")
-                .arg(viz_.routes.size())
+        if (route_count == 0) {
+            painter.drawText(24, 106, "Routes: 0    No route was loaded from result.txt");
+            return;
+        }
+
+        painter.drawText(24, 106, QString("Routes: %1").arg(route_count));
+
+        int y = 128;
+        for (std::size_t i = 0; i < route_rows; ++i) {
+            const Route& r = viz_.routes[i];
+            const QString label = r.label.empty()
+                ? QString("Route %1").arg(i + 1)
+                : QString::fromStdString(r.label);
+
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(to_qcolor(route_palette_color(i)));
+            painter.drawRoundedRect(QRectF(24, y - 9, 26, 7), 3, 3);
+
+            painter.setPen(QColor(245, 245, 245));
+            painter.drawText(58, y,
+                QString("%1: %2 nodes, distance %3 m, time %4 s")
+                .arg(label)
                 .arg(r.nodes.size())
                 .arg(r.total_dist_m, 0, 'f', 1)
                 .arg(r.total_time_s, 0, 'f', 1)
             );
 
-            int x = 24;
-            int y = 128;
-            for (std::size_t i = 0; i < viz_.routes.size() && i < 8; ++i) {
-                painter.setPen(Qt::NoPen);
-                painter.setBrush(to_qcolor(route_palette_color(i)));
-                painter.drawRoundedRect(QRectF(x, y - 9, 26, 7), 3, 3);
-
-                painter.setPen(QColor(245, 245, 245));
-                painter.drawText(x + 34, y, QString("Route %1").arg(i + 1));
-                x += 120;
-            }
+            y += route_row_height;
         }
-        else {
-            painter.drawText(24, 106, "Routes: 0    No route was loaded from result.txt");
+
+        if (routes_truncated) {
+            painter.setPen(QColor(210, 210, 210));
+            painter.drawText(58, y, QString("... and %1 more routes").arg(route_count - route_rows));
         }
     }
 };

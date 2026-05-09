@@ -116,26 +116,26 @@ out\build\msvc-release\bin\graph_builder.exe preprocess --pbf data\your_city.osm
 ---
 
 ### 3. Search (A*) по запросам из queries.txt
-создать в корне проекта файл `queries.txt` — по одной паре на строку:
+создать в корне проекта файл `input.txt` — по одной паре на строку:
 ```
-<source_id> <target_id>
+<source_lat> <source_long> <target_lat> <target_long>
 ```
-где `source_id` и `target_id` — **dense id 1..N** (это НЕ OSM id).
+где `<source_lat>` `<source_long>` `<target_lat>` `<target_long>` — Широта и долгота начала и конца маршрута.
 
-Пример `queries.txt`:
+Пример `input.txt`:
 ```
-1 10
-10 20
+52.595 38.408 57.2603 32.7003
+55.555 35.555 56.666 34.444
 ```
 
 **Windows:**
 ```powershell
-out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queries.txt --out result.txt --full
+out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in input.txt --out result.txt --full
 ```
 
 **Linux:**
 ```bash
-./out/build/linux-release/bin/graph_builder search --graph graph.bin --in queries.txt --out result.txt --full
+./out/build/linux-release/bin/graph_builder search --graph graph.bin --in input.txt --out result.txt --full
 ```
 
 Формат `result.txt`:
@@ -150,23 +150,22 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
 Положить файл карты в папку `data/`, например:
 - `data/your_city.osm.pbf`
 
-Создать в корне проекта файл `queries.txt` — по одной паре на строку:
+создать в корне проекта файл `input.txt` — по одной паре на строку:
 ```
-<source_id> <target_id>
+<source_lat> <source_long> <target_lat> <target_long>
 ```
-где `source_id` и `target_id` — **dense id 1..N** (это НЕ OSM id).
+где `<source_lat>` `<source_long>` `<target_lat>` `<target_long>` — Широта и долгота начала и конца маршрута.
 
-Пример `queries.txt`:
+Пример `input.txt`:
 ```
-1 10
-10 20
+52.595 38.408 57.2603 32.7003
+55.555 35.555 56.666 34.444
 ```
 ---
 
 ### 1. Создание пресетов
 
-В скрытой папке `.vs` создать файл `launch.vs.json`
-**launch.vs.json:**
+В скрытой папке `.vs` создать файл `launch.vs.json` и заменить your_city.osm.pbf на файл исходной карты:
 ```json
 {
   "version": "0.2.1",
@@ -179,7 +178,7 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
       "args": [
         "osm-info",
         "--pbf",
-        "../../data/central-fed-district-260214.osm.pbf"
+        "../../data/your_city.osm.pbf"
       ],
       "cwd": "${workspaceRoot}"
     },
@@ -191,7 +190,7 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
       "args": [
         "preprocess",
         "--pbf",
-        "../../data/central-fed-district-260214.osm.pbf",
+        "../../data/your_city.osm.pbf",
         "--out",
         "graph.bin",
         "--map",
@@ -209,7 +208,7 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
         "--graph",
         "graph.bin",
         "--in",
-        "../../queries.txt",
+        "../../input.txt",
         "--out",
         "../../../result.txt",
         "--full",
@@ -228,7 +227,7 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in queri
         "--graph",
         "graph.bin",
         "--in",
-        "../../queries.txt",
+        "../../input.txt",
         "--out",
         "../../../result.txt",
         "--full",

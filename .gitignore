@@ -47,3 +47,4 @@ data/
 out/
 
 .vs/
+/queries.txt

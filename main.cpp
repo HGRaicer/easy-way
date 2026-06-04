@@ -3,6 +3,9 @@
 #include "preprocess.hpp"
 #include "search.h"
 #include "geocode.hpp"
+#include "tsp.hpp"
+#include "csv_reader.hpp"
+#include "vrp_solver.hpp" 
 
 #include <cstdio>
 #include <filesystem>
@@ -20,11 +23,13 @@ static void usage(const char* exe) {
         << "  " << exe << " preprocess --pbf <file.osm.pbf> --out <graph.bin> [--map <id_map.csv>]\n"
         << "  " << exe << " search     --graph <graph.bin> --in <input.txt> [--queries <queries.txt|dir>] --out <result.txt> --metric <time/distance> [--full]\n"
         << "  " << exe << " visualize  --graph <graph.bin> [--result <result.txt>]\n"
+        << "  " << exe << " tsp        --graph <graph.bin> --in <input.txt> --out <result.txt> --map <id_map.csv> --metric <time/distance> [--full]\n"
         << "\n"
         << "Notes:\n"
         << "  - preprocess creates a dense graph: query node ids are 1..N\n"
         << "  - id_map.csv contains mapping dense_id -> original osm_id and coordinates\n"
-        << "  - search reads coordinate input.txt, writes generated queries.txt, then routes using that exact queries.txt\n";
+        << "  - search reads coordinate input.txt, writes generated queries.txt, then routes using that exact queries.txt\n"
+        << "  - tsp input format: one line with space-separated lat lon lat lon ... (first point is base)\n";
 }
 
 static std::string take_value(int& i, int argc, char** argv) {
@@ -390,7 +395,7 @@ int main(int argc, char** argv) {
 
         std::string err;
         std::cerr << "Converting coordinates from input.txt to dense node-id queries...\n";
-        if (!convert_coordinates_to_ids(map_csv_path.string(),
+        if (!operations_research::convert_coordinates_to_ids(map_csv_path.string(),
             input_rr.path.string(),
             queries_path.string(),
             err)) {
@@ -435,7 +440,179 @@ int main(int argc, char** argv) {
         std::cout << "Search OK\n";
         return 0;
     }
+    // ---------------- tsp ----------------
+    if (cmd == "tsp") {
+        std::string graph, in_txt, csv_points, out, map_csv;
+        bool full = false;
+        SearchMetric metric = SearchMetric::Distance;
 
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--graph") graph = take_value(i, argc, argv);
+            else if (a == "--in") in_txt = take_value(i, argc, argv);
+            else if (a == "--csv") csv_points = take_value(i, argc, argv);
+            else if (a == "--out") out = take_value(i, argc, argv);
+            else if (a == "--map") map_csv = take_value(i, argc, argv);
+            else if (a == "--full") full = true;
+            else if (a == "--metric") {
+                const std::string m = take_value(i, argc, argv);
+                if (m == "distance") metric = SearchMetric::Distance;
+                else if (m == "time") metric = SearchMetric::Time;
+                else { std::cerr << "Unknown metric: " << m << "\n"; return 1; }
+            }
+            else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
+        }
+
+        // 1.                                                                  
+        if (!in_txt.empty() && !csv_points.empty()) {
+            std::cerr << "Error: Flags --in and --csv are mutually exclusive. Choose only one source.\n";
+            return 1;
+        }
+        if (in_txt.empty() && csv_points.empty()) {
+            std::cerr << "Error: Missing source points. You must specify either --in <input.txt> or --csv <points.csv>.\n";
+            return 1;
+        }
+
+        // 2.                                           
+        if (graph.empty() || out.empty() || map_csv.empty()) {
+            std::cerr << "Usage:\n"
+                << "  TXT mode: " << argv[0] << " tsp --graph <graph.bin> --in <input.txt> --out <result.txt> --map <id_map.csv> [--full] [--metric time|distance]\n"
+                << "  CSV mode: " << argv[0] << " tsp --graph <graph.bin> --csv <points.csv> --out <result.txt> --map <id_map.csv> [--full] [--metric time|distance]\n";
+            return 1;
+        }
+
+        // 3.                       (                        )
+        auto graph_rr = resolve_existing(graph, cwd, exe_dir);
+        if (!graph_rr.found) {
+            print_not_found("Graph", graph_rr);
+            return 1;
+        }
+
+        auto map_rr = resolve_existing(map_csv, cwd, exe_dir);
+        if (!map_rr.found) {
+            print_not_found("Map CSV", map_rr);
+            return 1;
+        }
+
+        const fs::path out_path = make_output_path(out, cwd);
+        std::string err;
+        std::string target_input_file;
+        bool is_temporary_file = false;
+
+        // 4.                                                             
+        if (!csv_points.empty()) {
+            //                CSV (       tsp-csv)
+            auto csv_rr = resolve_existing(csv_points, cwd, exe_dir);
+            if (!csv_rr.found) {
+                print_not_found("CSV", csv_rr);
+                return 1;
+            }
+
+            std::vector<TspPoint> points;
+            if (!load_tsp_points_from_csv(csv_rr.path.string(), points, err)) {
+                std::cerr << "Failed to load CSV: " << err << "\n";
+                return 1;
+            }
+
+            //                                ,         solve_tsp                     .txt
+            target_input_file = "temp_tsp_input.txt";
+            write_tsp_input_file(target_input_file, points);
+            is_temporary_file = true;
+        }
+        else {
+            //                                                 
+            auto in_rr = resolve_existing(in_txt, cwd, exe_dir);
+            if (!in_rr.found) {
+                print_not_found("Input TXT", in_rr);
+                return 1;
+            }
+            target_input_file = in_rr.path.string();
+        }
+
+        // 5.                                     TSP
+        std::cout << "Starting TSP Optimization...\n";
+        bool success = solve_tsp(target_input_file,
+            graph_rr.path.string(),
+            out_path.string(),
+            map_rr.path.string(),
+            full,
+            metric,
+            err);
+
+        //                                     CSV                         
+        if (is_temporary_file) {
+            std::remove(target_input_file.c_str());
+        }
+
+        if (!success) {
+            std::cerr << "TSP failed: " << err << "\n";
+            return 1;
+        }
+
+        std::cout << "TSP OK. Results saved to " << out_path.string() << "\n";
+        return 0;
+    }
+    // ---------------- vrp ----------------
+    if (cmd == "vrp") {
+        std::string graph, csv, fleet, out, map_csv;
+        SearchMetric metric = SearchMetric::Distance;
+        bool full_output = false; //                                        
+
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--graph") graph = take_value(i, argc, argv);
+            else if (a == "--csv") csv = take_value(i, argc, argv);
+            else if (a == "--fleet") fleet = take_value(i, argc, argv);
+            else if (a == "--out") out = take_value(i, argc, argv);
+            else if (a == "--map") map_csv = take_value(i, argc, argv);
+            else if (a == "--full") {
+                full_output = true; //                                        
+            }
+            else if (a == "--metric") {
+                const std::string m = take_value(i, argc, argv);
+                if (m == "distance") metric = SearchMetric::Distance;
+                else if (m == "time") metric = SearchMetric::Time;
+                else { std::cerr << "Unknown metric: " << m << "\n"; return 1; }
+            }
+            else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
+        }
+
+        if (graph.empty() || csv.empty() || fleet.empty() || out.empty() || map_csv.empty()) {
+            std::cerr << "Usage: " << argv[0] << " vrp --graph <graph.bin> --csv <points.csv> --fleet <fleet.csv> --out <result.txt> --map <id_map.csv> [--metric time|distance] [--full]\n";
+            return 1;
+        }
+
+        auto graph_rr = resolve_existing(graph, cwd, exe_dir);
+        if (!graph_rr.found) { print_not_found("Graph", graph_rr); return 1; }
+
+        auto csv_rr = resolve_existing(csv, cwd, exe_dir);
+        if (!csv_rr.found) { print_not_found("CSV", csv_rr); return 1; }
+
+        auto fleet_rr = resolve_existing(fleet, cwd, exe_dir);
+        if (!fleet_rr.found) { print_not_found("Fleet CSV", fleet_rr); return 1; }
+
+        auto map_rr = resolve_existing(map_csv, cwd, exe_dir);
+        if (!map_rr.found) { print_not_found("Map CSV", map_rr); return 1; }
+
+        const fs::path out_path = make_output_path(out, cwd);
+
+        std::string err;
+        std::cout << "Starting VRP Optimization with Time Windows...\n";
+        if (!solve_new_vrp(csv_rr.path.string(),
+            fleet_rr.path.string(),
+            graph_rr.path.string(),
+            map_rr.path.string(),
+            out_path.string(),
+            metric,
+            full_output, //                               
+            err)) {
+            std::cerr << "VRP failed: " << err << "\n";
+            return 1;
+        }
+
+        std::cout << "VRP OK. Results saved to " << out_path.string() << "\n";
+        return 0;
+    }
     // ---------------- visualize ----------------
     if (cmd == "visualize") {
         std::string graph, result_txt;

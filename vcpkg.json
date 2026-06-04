@@ -8,6 +8,8 @@
     "zlib",
     "bzip2",
     "expat",
-    "qtbase"
+    "qtbase",
+    "re2",
+    "boost-geometry"
   ]
 }

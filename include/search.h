@@ -1,9 +1,11 @@
 #pragma once
+
 #include <cstdio>
+#include <string>
 
 enum class SearchMetric {
-    Distance,
-    Time
+    Time,
+    Distance
 };
 
 void run_search(FILE* graph_file,

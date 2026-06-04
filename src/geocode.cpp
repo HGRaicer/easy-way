@@ -2,148 +2,143 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
-#include <vector>
-#include <string>
 #include <cmath>
 #include <limits>
+#include <vector>
+#include <string>
 
-struct MapPoint {
-    int dense_id;
-    long long osm_id;
-    double lat;
-    double lon;
-};
+#include <boost/geometry.hpp>
+#include <boost/geometry/geometries/point.hpp>
+#include <boost/geometry/index/rtree.hpp>
 
-static double haversineDistance(double lat1, double lon1, double lat2, double lon2) {
-    const double R = 6371.0;
-    const double PI = 3.14159265358979323846;
+namespace bg = boost::geometry;
+namespace bgi = boost::geometry::index;
 
-    double dlat = (lat2 - lat1) * PI / 180.0;
-    double dlon = (lon2 - lon1) * PI / 180.0;
+// Используем geographic координатную систему (долгота, широта)
+using BoostPoint = bg::model::point<double, 2, bg::cs::geographic<bg::degree>>;
+using RtreeValue = std::pair<BoostPoint, uint32_t>;
 
-    double a = std::sin(dlat / 2) * std::sin(dlat / 2) +
-        std::cos(lat1 * PI / 180.0) * std::cos(lat2 * PI / 180.0) *
-        std::sin(dlon / 2) * std::sin(dlon / 2);
-    double c = 2 * std::atan2(std::sqrt(a), std::sqrt(1 - a));
+namespace operations_research {
 
-    return R * c;
-}
+    bool geocode_vector_of_coordinates(const std::string& mapCsvPath,
+        const std::vector<std::pair<double, double>>& coords,
+        std::vector<uint32_t>& output_node_ids,
+        std::string& error) {
 
-static bool loadPoints(const std::string& filename, std::vector<MapPoint>& points, std::string& error) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        error = "Cannot open: " + filename;
-        return false;
-    }
+        size_t n = coords.size();
+        if (n == 0) {
+            output_node_ids.clear();
+            return true;
+        }
+        output_node_ids.assign(n, 0);
 
-    std::string line;
-    // skip header
-    if (!std::getline(file, line)) {
-        error = "Empty file";
-        return false;
-    }
-
-    points.clear();
-    int lineNum = 2;
-
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
-
-        std::stringstream ss(line);
-        MapPoint p;
-        char comma;
-
-        if (!(ss >> p.dense_id >> comma >> p.osm_id >> comma >> p.lat >> comma >> p.lon)) {
-            error = "Parse error at line " + std::to_string(lineNum) + ": " + line;
+        std::ifstream csvFile(mapCsvPath);
+        if (!csvFile.is_open()) {
+            error = "Geocode Error: Cannot open map CSV file: " + mapCsvPath;
             return false;
         }
 
-        points.push_back(p);
-        lineNum++;
-    }
+        std::string line;
+        std::getline(csvFile, line); // Пропускаем заголовок
 
-    return true;
-}
+        std::vector<RtreeValue> rtree_elements;
+        rtree_elements.reserve(9500000);
 
-static int findNearestId(const std::vector<MapPoint>& points, double targetLat, double targetLon) {
-    if (points.empty()) return -1;
-
-    int bestId = points[0].dense_id;
-    double bestDist = haversineDistance(targetLat, targetLon, points[0].lat, points[0].lon);
-
-    for (const auto& p : points) {
-        double dist = haversineDistance(targetLat, targetLon, p.lat, p.lon);
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestId = p.dense_id;
+        while (std::getline(csvFile, line)) {
+            if (line.empty()) continue;
+            std::stringstream ss(line);
+            int dense_id; long long osm_id; double n_lat, n_lon; char c;
+            if (ss >> dense_id >> c >> osm_id >> c >> n_lat >> c >> n_lon) {
+                // Boost.Geometry требует порядок (Долгота, Широта)
+                rtree_elements.push_back(std::make_pair(BoostPoint(n_lon, n_lat), static_cast<uint32_t>(dense_id)));
+            }
         }
+        csvFile.close();
+
+        std::cerr << "[Geocode Engine] Loaded " << rtree_elements.size()
+            << " nodes from CSV. Building R-tree index..." << std::endl;
+
+        // Быстрое построение R-дерева методом OMT bulk-loading
+        bgi::rtree<RtreeValue, bgi::quadratic<16>> rtree(rtree_elements.begin(), rtree_elements.end());
+
+        rtree_elements.clear();
+        rtree_elements.shrink_to_fit();
+
+        std::cerr << "[Geocode Engine] R-tree built successfully. Starting spatial queries..." << std::endl;
+
+#pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < (int)n; ++i) {
+            double query_lat = coords[i].first;
+            double query_lon = coords[i].second;
+
+            BoostPoint query_point(query_lon, query_lat);
+            std::vector<RtreeValue> result_nodes;
+
+            // Исправлено: bgi::index::nearest вместо некорректного bgi::queries::nearest
+            rtree.query(bgi::nearest(query_point, 1), std::back_inserter(result_nodes));
+
+            if (!result_nodes.empty()) {
+                output_node_ids[i] = result_nodes[0].second;
+            }
+            else {
+                output_node_ids[i] = 0;
+            }
+        }
+
+        std::cerr << "[Geocode Engine] Spatial matching completed for " << n << " points." << std::endl;
+        return true;
     }
 
-    return bestId;
-}
+    bool convert_coordinates_to_ids(const std::string& mapCsvPath,
+        const std::string& inputTxtPath,
+        const std::string& outputQueriesPath,
+        std::string& error) {
 
-bool convert_coordinates_to_ids(const std::string& mapCsvPath,
-    const std::string& inputTxtPath,
-    const std::string& outputQueriesPath,
-    std::string& error) {
-
-    // 1. Load points from CSV
-    std::vector<MapPoint> points;
-    if (!loadPoints(mapCsvPath, points, error)) {
-        return false;
-    }
-
-    std::cerr << "Loaded " << points.size() << " points from CSV" << std::endl;
-
-    // 2. Open input.txt
-    std::ifstream inputFile(inputTxtPath);
-    if (!inputFile.is_open()) {
-        error = "Cannot open input file: " + inputTxtPath;
-        return false;
-    }
-
-    // 3. Open output (queries.txt)
-    std::ofstream outputFile(outputQueriesPath);
-    if (!outputFile.is_open()) {
-        error = "Cannot open output file: " + outputQueriesPath;
-        return false;
-    }
-
-    // 4. Process each line
-    std::string line;
-    int lineNum = 1;
-    int convertedCount = 0;
-
-    while (std::getline(inputFile, line)) {
-        if (line.empty() || line[0] == '#') continue;
-
-        std::stringstream ss(line);
-        double lat1, lon1, lat2, lon2;
-
-        if (!(ss >> lat1 >> lon1 >> lat2 >> lon2)) {
-            error = "Invalid format at line " + std::to_string(lineNum) +
-                ". Expected: lat1 lon1 lat2 lon2";
+        std::ifstream inputFile(inputTxtPath);
+        if (!inputFile.is_open()) {
+            error = "Cannot open input file: " + inputTxtPath;
             return false;
         }
 
-        int id1 = findNearestId(points, lat1, lon1);
-        int id2 = findNearestId(points, lat2, lon2);
+        struct QueryPair { std::pair<double, double> p1; std::pair<double, double> p2; };
+        std::vector<QueryPair> queryPairs;
+        std::vector<std::pair<double, double>> flat_coords;
 
-        if (id1 == -1 || id2 == -1) {
-            error = "No points found for line " + std::to_string(lineNum);
+        std::string line;
+        while (std::getline(inputFile, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::stringstream ss(line);
+            double lat1, lon1, lat2, lon2;
+            if (!(ss >> lat1 >> lon1 >> lat2 >> lon2)) {
+                error = "Invalid format in input file";
+                return false;
+            }
+            queryPairs.push_back({ {lat1, lon1}, {lat2, lon2} });
+            flat_coords.push_back({ lat1, lon1 });
+            flat_coords.push_back({ lat2, lon2 });
+        }
+        inputFile.close();
+
+        std::vector<uint32_t> flat_ids;
+        if (!geocode_vector_of_coordinates(mapCsvPath, flat_coords, flat_ids, error)) {
             return false;
         }
 
-        outputFile << id1 << " " << id2 << std::endl;
+        std::ofstream outputFile(outputQueriesPath);
+        if (!outputFile.is_open()) {
+            error = "Cannot open output file: " + outputQueriesPath;
+            return false;
+        }
 
-        std::cerr << "Line " << lineNum << ": (" << lat1 << "," << lon1 << ") -> id " << id1
-            << ", (" << lat2 << "," << lon2 << ") -> id " << id2 << std::endl;
+        size_t id_idx = 0;
+        for (size_t i = 0; i < queryPairs.size(); ++i) {
+            uint32_t id1 = flat_ids[id_idx++];
+            uint32_t id2 = flat_ids[id_idx++];
+            outputFile << id1 << " " << id2 << "\n";
+        }
+        outputFile.close();
 
-        lineNum++;
-        convertedCount++;
+        return true;
     }
 
-    std::cerr << "Converted " << convertedCount << " pairs to " << outputQueriesPath << std::endl;
-
-    return true;
-}
+} // namespace operations_research

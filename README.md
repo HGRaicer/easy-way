@@ -50,7 +50,10 @@ cmake --build --preset msvc-release
 1) Установить инструменты сборки (пример для Ubuntu/Debian):
 ```bash
 sudo apt update
-sudo apt install -y build-essential git cmake ninja-build pkg-config
+sudo apt install -y build-essential git cmake ninja-build pkg-config \
+                   libx11-dev libxft-dev libxext-dev libgl1-mesa-dev \
+                   libglu1-mesa-dev libxrandr-dev libxi-dev libxcursor-dev \
+                   libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
 ```
 
 2) Установить vcpkg:
@@ -115,32 +118,137 @@ out\build\msvc-release\bin\graph_builder.exe preprocess --pbf data\your_city.osm
 
 ---
 
-### 3. Search (A*) по запросам из queries.txt
-создать в корне проекта файл `input.txt` — по одной паре на строку:
+### 3. Search (A*) по запросам из input.csv
+создать в корне проекта файл `input.csv` — по одной паре на строку:
 ```
 <source_lat> <source_long> <target_lat> <target_long>
 ```
 где `<source_lat>` `<source_long>` `<target_lat>` `<target_long>` — Широта и долгота начала и конца маршрута.
 
-Пример `input.txt`:
+Пример `input.csv`:
 ```
-52.595 38.408 57.2603 32.7003
-55.555 35.555 56.666 34.444
+lat,lon,lat2,lon2
+52.595,38.408,57.2603,32.7003
+55.555,35.555,56.666,34.444
 ```
+По времени:
 
 **Windows:**
 ```powershell
-out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in input.txt --out result.txt --full
+out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in input.txt --out result.txt --metric time --full
 ```
 
 **Linux:**
 ```bash
-./out/build/linux-release/bin/graph_builder search --graph graph.bin --in input.txt --out result.txt --full
+./out/build/linux-release/bin/graph_builder search --graph graph.bin --in input.txt --out result.txt --metric time --full
 ```
 
 Формат `result.txt`:
-- без `--full`: `distance` или `-1`
-- с `--full`: `distance k v1 v2 ... vk`
+- без `--full`: `time distance` или `-1`
+- с `--full`: `time distance k v1 v2 ... vk`
+
+По расстоянию:
+
+**Windows:**
+
+```powershell
+out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in input.txt --out result.txt --metric distance --full
+```
+
+**Linux:**
+
+```bash
+./out/build/linux-release/bin/graph_builder search --graph graph.bin --in input.txt --out result.txt --metric distance --full
+```
+
+
+---
+
+### 5. Visualize
+
+Отображение маршрута из файла результатов.
+
+**Windows:**
+
+```powershell
+out\build\msvc-release\bin\graph_builder.exe visualize --graph graph.bin --result result.txt
+```
+
+**Linux:**
+
+```bash
+./out/build/linux-release/bin/graph_builder visualize --graph graph.bin --result result.txt
+```
+
+---
+
+### 6. TSP (Travelling Salesman Problem)
+
+Подготовить файл `points.csv` формата
+```
+id, lat,lon
+1, 55.7558, 37.6173
+2, 55.5714, 37.6856
+3, 55.8094, 37.4536
+4, 55.6944, 37.3483
+```
+
+По расстоянию:
+
+**Windows**
+
+```powershell
+out\build\msvc-release\bin\graph_builder.exe tsp --graph graph.bin --csv points.csv --out tsp_result.txt --map id_map.csv --metric distance --full
+```
+
+**Linux**
+
+```bash
+./out/build/linux-release/bin/graph_builder tsp --graph graph.bin --csv points.csv --out tsp_result.txt --map id_map.csv --metric distance --full
+```
+
+По времени:
+
+```bash
+tsp --graph graph.bin --csv points.csv --out tsp_result.txt --map id_map.csv --metric time --full
+```
+
+---
+
+### 7. VRP (Vehicle Routing Problem)
+
+Подготовить файлы:
+
+* `vrp_points.csv` формата
+```
+id,lat,lon,demand,tw_start,tw_end
+0,55.755826,37.617299,0,0,86400
+1,55.751244,37.618421,15,0,86400
+2,55.759322,37.625103,40,0,86400
+3,55.741511,37.612033,25,10000,50400
+4,55.762111,37.601122,30,0,86400
+5,55.733222,37.634455,20,70000,86400
+```
+* `fleet.csv` формата
+```
+vehicle_id,capacity
+1,50
+2,100
+3,45
+```
+
+По расстоянию:
+
+```bash
+vrp --graph graph.bin --csv vrp_points.csv --out vrp_result.txt --map id_map.csv --metric distance --fleet fleet.csv --full
+```
+
+По времени:
+
+```bash
+vrp --graph graph.bin --csv vrp_points.csv --out vrp_result.txt --map id_map.csv --metric time --fleet fleet.csv --full
+```
+
 
 -----------------
 
@@ -150,16 +258,51 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in input
 Положить файл карты в папку `data/`, например:
 - `data/your_city.osm.pbf`
 
-создать в корне проекта файл `input.txt` — по одной паре на строку:
+### Для А*
+
+создать в корне проекта файл `input.csv` — по одной паре на строку:
 ```
 <source_lat> <source_long> <target_lat> <target_long>
 ```
 где `<source_lat>` `<source_long>` `<target_lat>` `<target_long>` — Широта и долгота начала и конца маршрута.
 
-Пример `input.txt`:
+Пример `input.csv`:
 ```
-52.595 38.408 57.2603 32.7003
-55.555 35.555 56.666 34.444
+lat,lon,lat2,lon2
+52.595,38.408,57.2603,32.7003
+55.555,35.555,56.666,34.444
+```
+### Для TSP
+
+Подготовить файл `points.csv` формата
+```
+id, lat,lon
+1, 55.7558, 37.6173
+2, 55.5714, 37.6856
+3, 55.8094, 37.4536
+4, 55.6944, 37.3483
+```
+
+### Для VRP
+
+Подготовить файлы:
+
+* `vrp_points.csv` формата
+```
+id,lat,lon,demand,tw_start,tw_end
+0,55.755826,37.617299,0,0,86400
+1,55.751244,37.618421,15,0,86400
+2,55.759322,37.625103,40,0,86400
+3,55.741511,37.612033,25,10000,50400
+4,55.762111,37.601122,30,0,86400
+5,55.733222,37.634455,20,70000,86400
+```
+* `fleet.csv` формата
+```
+vehicle_id,capacity
+1,50
+2,100
+3,45
 ```
 ---
 
@@ -246,7 +389,95 @@ out\build\msvc-release\bin\graph_builder.exe search --graph graph.bin --in input
         "--graph",
         "graph.bin",
         "--result",
-        "../../../result.txt",
+        "../../../result.txt"
+      ],
+      "cwd": "${workspaceRoot}"
+    },
+    {
+      "name": "TSP (distance)",
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "",
+      "args": [
+        "tsp",
+        "--graph",
+        "graph.bin",
+        "--csv",
+        "../../points.csv",
+        "--out",
+        "../../../tsp_result1.txt",
+        "--map",
+        "id_map.csv",
+        "--metric",
+        "distance",
+        "--full"
+      ],
+      "cwd": "${workspaceRoot}"
+    },
+    {
+      "name": "TSP (time)",
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "",
+      "args": [
+        "tsp",
+        "--graph",
+        "graph.bin",
+        "--csv",
+        "../../points.csv",
+        "--out",
+        "../../../tsp_result.txt",
+        "--map",
+        "id_map.csv",
+        "--metric",
+        "time",
+        "--full"
+      ],
+      "cwd": "${workspaceRoot}"
+    },
+    {
+      "name": "VRP (time)",
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "",
+      "args": [
+        "vrp",
+        "--graph",
+        "graph.bin",
+        "--csv",
+        "../../vrp_points.csv",
+        "--out",
+        "../../../vrp_result.txt",
+        "--map",
+        "id_map.csv",
+        "--metric",
+        "time",
+        "--fleet",
+        "../../fleet.csv",
+        "--full"
+      ],
+      "cwd": "${workspaceRoot}"
+    },
+    {
+      "name": "VRP (distance)",
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "",
+      "args": [
+        "vrp",
+        "--graph",
+        "graph.bin",
+        "--csv",
+        "../../vrp_points.csv",
+        "--out",
+        "../../../vrp_result.txt",
+        "--map",
+        "id_map.csv",
+        "--metric",
+        "distance",
+        "--fleet",
+        "../../fleet.csv",
+        "--full"
       ],
       "cwd": "${workspaceRoot}"
     },

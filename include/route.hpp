@@ -3,6 +3,11 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+struct RouteTarget {
+    std::uint32_t dense_id; // Скорректированный 0-based ID для графа
+    double arrival_time_s;  // Время прибытия в секундах (0.0 для TSP)
+    bool is_depot;          // Флаг депо (для покраски в другой цвет)
+};
 
 struct Rgba {
     std::uint8_t r = 74;
@@ -18,6 +23,8 @@ struct Route {
     std::string label = "Route";
     Rgba color{ 74, 144, 226, 255 };
     bool visible = true;
+
+    std::vector<RouteTarget> targets;
 };
 
 struct Waypoint {

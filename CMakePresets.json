@@ -8,7 +8,7 @@
       "binaryDir": "${sourceDir}/out/build/${presetName}",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_TOOLCHAIN_FILE": "C:/dev/vcpkg/scripts/buildsystems\\vcpkg.cmake",
+        "CMAKE_TOOLCHAIN_FILE": "C:\\Users\\Raicer\\vcpkg\\scripts\\buildsystems\\vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     },
@@ -19,7 +19,7 @@
       "binaryDir": "${sourceDir}/out/build/${presetName}",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "C:/dev/vcpkg/scripts/buildsystems\\vcpkg.cmake",
+        "CMAKE_TOOLCHAIN_FILE": "C:\\Users\\Raicer\\vcpkg\\scripts\\buildsystems\\vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     }

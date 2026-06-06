@@ -1,4 +1,4 @@
-#include "graph_loader.hpp"
+﻿#include "graph_loader.hpp"
 
 #include <array>
 #include <cmath>
@@ -86,51 +86,139 @@ uint32_t LoadedGraph::find_nearest(double lat, double lon) const {
     return best;
 }
 
+std::string trim(const std::string& s) {
+    auto start = s.find_first_not_of(" \t\r\n");
+    auto end = s.find_last_not_of(" \t\r\n");
+    return (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
+}
+
 void load_routes_from_file(const std::string& result_txt, std::vector<Route>& routes_out) {
     static const std::array<Rgba, 10> kRoutePalette = { {
-        {  74, 144, 226, 255},
-        {  80, 190, 170, 255},
-        { 156, 120, 210, 255},
-        { 230, 145,  72, 255},
-        { 105, 185, 110, 255},
-        { 214, 105, 135, 255},
-        {  88, 170, 205, 255},
-        { 218, 190,  85, 255},
-        { 170, 135, 100, 255},
+        { 74, 144, 226, 255}, { 80, 190, 170, 255}, { 156, 120, 210, 255},
+        { 230, 145,  72, 255}, { 105, 185, 110, 255}, { 214, 105, 135, 255},
+        {  88, 170, 205, 255}, { 218, 190,  85, 255}, { 170, 135, 100, 255},
         { 130, 160, 230, 255}
     } };
 
     std::ifstream in(result_txt);
     if (!in) return;
 
+    std::vector<std::vector<RouteTarget>> vrp_targets_by_vehicle;
+    std::vector<RouteTarget> tsp_targets;
+    int current_summary_vehicle_idx = -1;
+
     std::string line;
     while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '-') continue;
+        std::string t_line = trim(line);
+        if (t_line.empty()) continue;
 
-        std::istringstream iss(line);
+        // --- БЛОК ПАРСИНГА ТОЧЕК ПОСЕЩЕНИЯ (TARGETS) ---
+
+        // Для VRP: собираем точки из секции "Vehicle X Route Summary"
+        if (t_line.find("Vehicle ") == 0 && t_line.find(" Route Summary:") != std::string::npos) {
+            if (sscanf(t_line.c_str(), "Vehicle %d", &current_summary_vehicle_idx) == 1) {
+                current_summary_vehicle_idx--; // в 0-based
+                if (current_summary_vehicle_idx >= (int)vrp_targets_by_vehicle.size())
+                    vrp_targets_by_vehicle.resize(current_summary_vehicle_idx + 1);
+            }
+            continue;
+        }
+
+        // Для VRP: парсим строку с Dense ID внутри Summary
+        if (t_line.find("[Dense ID: ") != std::string::npos && t_line.find("* Arrive:") != std::string::npos) {
+            uint32_t dense_id = 0;
+            double arr_time = 0;
+            size_t p_dens = t_line.find("[Dense ID: ");
+            size_t p_arr = t_line.find("* Arrive: ");
+
+            sscanf(t_line.c_str() + p_dens, "[Dense ID: %u]", &dense_id);
+            sscanf(t_line.c_str() + p_arr, "* Arrive: %lfs", &arr_time);
+
+            if (current_summary_vehicle_idx >= 0) {
+                RouteTarget tgt;
+                tgt.dense_id = (dense_id > 0) ? (dense_id - 1) : 0;
+                tgt.arrival_time_s = arr_time;
+                tgt.is_depot = (t_line.find("DEPOT") != std::string::npos);
+                vrp_targets_by_vehicle[current_summary_vehicle_idx].push_back(tgt);
+            }
+            continue;
+        }
+
+        // Для TSP: собираем точки из секции "Optimal order"
+        if (t_line.find("-> node_id ") != std::string::npos) {
+            uint32_t node_id = 0;
+            size_t pos = t_line.find("node_id ");
+            if (sscanf(t_line.c_str() + pos, "node_id %u", &node_id) == 1) {
+                RouteTarget tgt;
+                tgt.dense_id = (node_id > 0) ? (node_id - 1) : 0;
+                tgt.arrival_time_s = 0.0; // Для TSP время не критично в легенде
+                tgt.is_depot = (t_line.find("(BASE)") != std::string::npos);
+                tsp_targets.push_back(tgt);
+            }
+            continue;
+        }
+
+        // --- БЛОК ПАРСИНГА ГЕОМЕТРИИ (NODES) ---
 
         Route r;
-        std::uint32_t node_count = 0;
+        bool has_route = false;
+        int active_vehicle_id = -1;
 
-        // result.txt format, one route per line:
-        // <time_seconds> <distance_meters> <node_count> <dense_id_1> ... <dense_id_N>
-        if (!(iss >> r.total_time_s >> r.total_dist_m >> node_count)) continue;
-        if (node_count < 2) continue;
-
-        r.nodes.reserve(node_count);
-        for (std::uint32_t i = 0; i < node_count; ++i) {
-            std::uint32_t id = 0;
-            if (!(iss >> id)) break;
-            if (id > 0) {
-                r.nodes.push_back(id - 1); // result.txt uses dense ids 1..N, app uses 0..N-1
+        // 1. Формат TSP (сегменты пути)
+        if (t_line.find("Route from Point") == 0) {
+            double tm = 0, ds = 0;
+            if (sscanf(t_line.c_str(), "Route from Point %*d to Point %*d (Time: %lfs, Dist: %lfm)", &tm, &ds) >= 2) {
+                r.total_time_s = tm;
+                r.total_dist_m = ds;
+                if (std::getline(in, line)) {
+                    std::stringstream ss(line);
+                    uint32_t id;
+                    while (ss >> id) r.nodes.push_back(id > 0 ? id - 1 : 0);
+                    has_route = true;
+                }
+            }
+        }
+        // 2. Формат VRP (цельный трек машины)
+        else if (t_line.find("Vehicle") == 0 && t_line.find("Route Sequence") != std::string::npos) {
+            sscanf(t_line.c_str(), "Vehicle %d", &active_vehicle_id);
+            active_vehicle_id--;
+            if (std::getline(in, line)) {
+                std::stringstream ss(line);
+                uint32_t count;
+                if (ss >> r.total_time_s >> r.total_dist_m >> count) {
+                    uint32_t id;
+                    while (ss >> id) r.nodes.push_back(id > 0 ? id - 1 : 0);
+                    has_route = true;
+                }
+            }
+        }
+        // 3. Формат A* (простая числовая строка)
+        else if (std::isdigit((unsigned char)t_line[0])) {
+            std::stringstream ss(t_line);
+            uint32_t count;
+            if (ss >> r.total_time_s >> r.total_dist_m >> count) {
+                uint32_t id;
+                while (ss >> id) r.nodes.push_back(id > 0 ? id - 1 : 0);
+                has_route = true;
             }
         }
 
-        if (r.nodes.size() >= 2) {
-            const std::size_t route_index = routes_out.size();
-            r.label = "Route " + std::to_string(route_index + 1);
-            r.color = kRoutePalette[route_index % kRoutePalette.size()];
-            r.visible = true;
+        if (has_route && !r.nodes.empty()) {
+            size_t idx = routes_out.size();
+            r.label = "Route " + std::to_string(idx + 1);
+            r.color = kRoutePalette[idx % kRoutePalette.size()];
+
+            // Привязка таргетов (флажков)
+            if (active_vehicle_id >= 0 && active_vehicle_id < (int)vrp_targets_by_vehicle.size()) {
+                // Это VRP трек - берем таргеты именно этой машины
+                r.targets = vrp_targets_by_vehicle[active_vehicle_id];
+            }
+            else if (!tsp_targets.empty()) {
+                // Это TSP трек - привязываем все собранные точки TSP
+                // (Для TSP обычно один общий набор точек на все сегменты)
+                r.targets = tsp_targets;
+            }
+
             routes_out.push_back(std::move(r));
         }
     }

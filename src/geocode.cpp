@@ -74,7 +74,7 @@ namespace operations_research {
             BoostPoint query_point(query_lon, query_lat);
             std::vector<RtreeValue> result_nodes;
 
-            // Исправлено: bgi::index::nearest вместо некорректного bgi::queries::nearest
+            
             rtree.query(bgi::nearest(query_point, 1), std::back_inserter(result_nodes));
 
             if (!result_nodes.empty()) {

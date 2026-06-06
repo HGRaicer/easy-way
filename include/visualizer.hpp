@@ -7,7 +7,9 @@
 #include <string>
 #include <vector>
 
+// ¬перед-обращенное объ€вление, чтобы не тащить т€желые заголовки Qt
 class QtGraphWidget;
+class QWidget;
 
 class GraphVisualizer {
 public:
@@ -17,7 +19,12 @@ public:
     void clear_routes() { routes.clear(); }
     void clear_waypoints() { waypoints.clear(); }
 
+    
     void run();
+
+    
+    QWidget* createWidget(QWidget* parent = nullptr); // —оздает и возвращает виджет карты
+    void updateVisuals();                            // ќбновл€ет карту на экране
 
 private:
     struct WorldPoint {
@@ -45,4 +52,7 @@ private:
     void build_spatial_grid();
 
     friend class QtGraphWidget;
+
+    // —сылка на текущий активный виджет (если он создан внутри интерфейса)
+    QtGraphWidget* m_activeWidget = nullptr;
 };

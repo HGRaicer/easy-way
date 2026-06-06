@@ -1,11 +1,11 @@
 #include "visualizer.hpp"
-#include "osm_graph.hpp"
 #include "preprocess.hpp"
 #include "search.h"
 #include "geocode.hpp"
 #include "tsp.hpp"
 #include "csv_reader.hpp"
 #include "vrp_solver.hpp" 
+#include "mainwindow.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -14,12 +14,14 @@
 #include <system_error>
 #include <vector>
 
+
+#include <QtWidgets/QApplication>
+
 namespace fs = std::filesystem;
 
 static void usage(const char* exe) {
     std::cerr
         << "Usage:\n"
-        << "  " << exe << " osm-info   --pbf <file.osm.pbf>\n"
         << "  " << exe << " preprocess --pbf <file.osm.pbf> --out <graph.bin> [--map <id_map.csv>]\n"
         << "  " << exe << " search     --graph <graph.bin> --in <input.txt> [--queries <queries.txt|dir>] --out <result.txt> --metric <time/distance> [--full]\n"
         << "  " << exe << " visualize  --graph <graph.bin> [--result <result.txt>]\n"
@@ -198,6 +200,22 @@ static fs::path find_id_map_csv(const fs::path& graph_path,
 }
 
 int main(int argc, char** argv) {
+
+    if (argc == 1) {
+        QApplication app(argc, argv);
+
+        // Устанавливаем иконку и стиль
+        app.setApplicationName("Graph Optimizer Pro");
+
+        app.setWindowIcon(QIcon("res/app_icon.ico"));
+
+        MainWindow window;
+        window.show();
+
+        return app.exec();
+    }
+
+
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -210,52 +228,7 @@ int main(int argc, char** argv) {
     ec.clear();
     const fs::path exe_dir = fs::absolute(argv[0], ec).parent_path();
 
-    // ---------------- osm-info ----------------
-    if (cmd == "osm-info") {
-        std::string pbf;
-
-        for (int i = 2; i < argc; ++i) {
-            std::string a = argv[i];
-            if (a == "--pbf") pbf = take_value(i, argc, argv);
-            else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
-        }
-
-        if (pbf.empty()) {
-            usage(argv[0]);
-            return 1;
-        }
-
-        auto rr = resolve_existing(pbf, cwd, exe_dir);
-        std::cerr << "cwd: " << cwd.string() << "\n";
-        std::cerr << "exe dir: " << exe_dir.string() << "\n";
-
-        if (!rr.found) {
-            print_not_found("PBF", rr);
-            return 1;
-        }
-
-        std::cerr << "pbf: " << rr.path.string() << "\n";
-
-        try {
-            OsmGraph g = build_graph_from_pbf(rr.path.string());
-            std::cout << "OK\n";
-            std::cout << "Nodes: " << g.nodes.size() << "\n";
-            std::cout << "Edges: " << g.edges.size() << "\n";
-            return 0;
-        }
-        catch (const std::system_error& e) {
-            std::cerr << "system_error: " << e.what()
-                << "\ncode: " << e.code()
-                << "\nvalue: " << e.code().value()
-                << "\nmessage: " << e.code().message()
-                << "\n";
-            return 1;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "exception: " << e.what() << "\n";
-            return 1;
-        }
-    }
+    
 
     // ---------------- preprocess ----------------
     if (cmd == "preprocess") {

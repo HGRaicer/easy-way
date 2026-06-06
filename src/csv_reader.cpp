@@ -2,6 +2,8 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <algorithm>
+#include <iomanip>
 
 bool load_tsp_points_from_csv(const std::string& csv_path,
     std::vector<TspPoint>& points,
@@ -108,5 +110,58 @@ bool save_id_mapping(const std::vector<TspPoint>& points,
         out << points[i].user_id << "," << dense_ids[i] << ","
             << points[i].lat << "," << points[i].lon << std::endl;
     }
+    return true;
+}
+
+bool parse_coordinate_pairs_csv_to_txt(const std::string& csv_path,
+    const std::string& txt_out_path,
+    std::string& error_msg) {
+    std::ifstream file(csv_path);
+    if (!file.is_open()) {
+        error_msg = "Cannot open CSV file: " + csv_path;
+        return false;
+    }
+
+    std::vector<std::string> queries;
+    std::string line;
+
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+
+        // «амен€ем попул€рные разделители на пробелы
+        std::replace(line.begin(), line.end(), ',', ' ');
+        std::replace(line.begin(), line.end(), ';', ' ');
+
+        std::istringstream iss(line);
+        double lat1, lon1, lat2, lon2;
+
+        // ≈сли удалось считать 4 числа подр€д Ч сохран€ем их
+        if (iss >> lat1 >> lon1 >> lat2 >> lon2) {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(6)
+                << lat1 << " " << lon1 << " " << lat2 << " " << lon2;
+            queries.push_back(oss.str());
+        }
+    }
+
+    if (queries.empty()) {
+        error_msg = "No valid coordinate pairs (lat1, lon1, lat2, lon2) found in CSV.";
+        return false;
+    }
+
+    std::ofstream out(txt_out_path);
+    if (!out.is_open()) {
+        error_msg = "Cannot create temp txt file: " + txt_out_path;
+        return false;
+    }
+
+    // «аписываем собранные запросы, раздел€€ переносом строки
+    for (size_t i = 0; i < queries.size(); ++i) {
+        out << queries[i];
+        if (i + 1 < queries.size()) {
+            out << "\n";
+        }
+    }
+
     return true;
 }

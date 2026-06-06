@@ -44,7 +44,7 @@ namespace operations_research {
             [&time_matrix, &manager](int64_t from_index, int64_t to_index) -> int64_t {
                 int from_node = manager.IndexToNode(from_index).value();
                 int to_node = manager.IndexToNode(to_index).value();
-                return time_matrix[from_node][to_node] / 1000;
+                return time_matrix[from_node][to_node];
             }
         );
 
@@ -63,10 +63,10 @@ namespace operations_research {
         );
         routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, vehicle_capacity, true, "Capacity");
 
-        int64_t time_horizon = 86400;
+        int64_t time_horizon = 86400 * 1000;
         routing.AddDimension(time_callback_index, time_horizon, time_horizon, false, "Time");
 
-        int64_t max_shift_duration = 12 * 3600;
+        int64_t max_shift_duration = 12 * 3600 * 1000;
         for (int v = 0; v < num_vehicles; ++v) {
             routing.GetMutableDimension("Time")->SetSpanUpperBoundForVehicle(max_shift_duration, v);
         }
@@ -74,8 +74,8 @@ namespace operations_research {
 
         for (int i = 1; i < num_nodes; ++i) {
             int64_t index = manager.NodeToIndex(RoutingIndexManager::NodeIndex{ i });
-            int64_t tw_start = config.points[i].tw_start;
-            int64_t tw_end = config.points[i].tw_end;
+            int64_t tw_start = config.points[i].tw_start * 1000;
+            int64_t tw_end = config.points[i].tw_end * 1000;
             routing.GetMutableDimension("Time")->CumulVar(index)->SetRange(tw_start, tw_end);
         }
 
@@ -160,40 +160,6 @@ static bool parse_fleet_csv(const std::string& path, std::vector<int64_t>& capac
     return !capacities.empty();
 }
 
-static bool NewGetPairMetrics(FILE* graph_file, uint32_t from_id, uint32_t to_id, SearchMetric metric,
-    const std::string& tempInput, const std::string& tempOutput,
-    int64_t& time_val, int64_t& dist_val) {
-    std::ofstream in(tempInput);
-    if (!in) return false;
-    in << from_id << " " << to_id << "\n";
-    in.close();
-
-    FILE* inf = fopen(tempInput.c_str(), "r");
-    FILE* outf = fopen(tempOutput.c_str(), "w");
-    if (!inf || !outf) {
-        if (inf) fclose(inf); if (outf) fclose(outf);
-        return false;
-    }
-
-    fseek(graph_file, 0, SEEK_SET);
-    run_search(graph_file, inf, outf, true, metric);
-    fclose(inf); fclose(outf);
-
-    std::ifstream out(tempOutput);
-    if (!out.is_open()) return false;
-
-    double t_raw = 0.0, d_raw = 0.0;
-    if (!(out >> t_raw >> d_raw)) {
-        out.close();
-        return false;
-    }
-    out.close();
-
-    time_val = static_cast<int64_t>(t_raw * 1000.0);
-    dist_val = static_cast<int64_t>(d_raw * 1000.0);
-    return true;
-}
-
 bool solve_new_vrp(const std::string& csvPath,
     const std::string& fleetCsvPath,
     const std::string& graphBinPath,
@@ -227,23 +193,70 @@ bool solve_new_vrp(const std::string& csvPath,
     std::vector<std::vector<int64_t>> time_matrix(n, std::vector<int64_t>(n, 0));
     std::vector<std::vector<int64_t>> dist_matrix(n, std::vector<int64_t>(n, 0));
 
+    // =========================================================================
+    // œ¿ ≈“Õ¿ﬂ √≈Õ≈–¿÷»ﬂ Ã¿“–»÷€ (Œœ“»Ã»«¿÷»ﬂ O(1) ¬Ã≈—“Œ O(N^2) ¬€«Œ¬Œ¬ ‘¿…ÀŒ¬)
+    // =========================================================================
     std::string matIn = "temp_matrix_in.txt";
     std::string matOut = "temp_matrix_out.txt";
 
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            if (i == j) continue;
-            int64_t t_val = 0, d_val = 0;
-            if (!NewGetPairMetrics(graph_file, node_ids[i], node_ids[j], metric, matIn, matOut, t_val, d_val)) {
-                t_val = 3600 * 1000;
-                d_val = 50000 * 1000;
+    {
+        std::ofstream in(matIn);
+        if (!in) { fclose(graph_file); error = "Cannot create temp matrix input file"; return false; }
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                if (i == j) continue;
+                in << node_ids[i] << " " << node_ids[j] << "\n";
             }
-            time_matrix[i][j] = t_val;
-            dist_matrix[i][j] = d_val;
         }
     }
+
+    FILE* inf = fopen(matIn.c_str(), "r");
+    FILE* outf = fopen(matOut.c_str(), "w");
+    if (!inf || !outf) {
+        if (inf) fclose(inf); if (outf) fclose(outf);
+        fclose(graph_file); error = "Failed to open temporary batch files for matrix."; return false;
+    }
+
+    fseek(graph_file, 0, SEEK_SET);
+    run_search(graph_file, inf, outf, false, metric); // full_output = false ‰Îˇ Ï‡ÚËˆ˚
+    fclose(inf); fclose(outf);
+
+    std::ifstream out(matOut);
+    if (!out.is_open()) { fclose(graph_file); error = "Failed to open temporary matrix output."; return false; }
+
+    std::string raw_line;
+    std::getline(out, raw_line); // œÓÔÛÒÍ ·‡ÌÌÂ‡ "=== A* Optimization Result ==="
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            if (i == j) {
+                time_matrix[i][j] = 0;
+                dist_matrix[i][j] = 0;
+                continue;
+            }
+            if (std::getline(out, raw_line)) {
+                std::stringstream ss(raw_line);
+                double t_raw = 0.0, d_raw = 0.0;
+                if (ss >> t_raw >> d_raw) {
+                    time_matrix[i][j] = static_cast<int64_t>(t_raw * 1000.0);
+                    dist_matrix[i][j] = static_cast<int64_t>(d_raw * 1000.0);
+                }
+                else {
+                    time_matrix[i][j] = 3600 * 1000;
+                    dist_matrix[i][j] = 50000 * 1000;
+                }
+            }
+            else {
+                time_matrix[i][j] = 3600 * 1000;
+                dist_matrix[i][j] = 50000 * 1000;
+            }
+        }
+    }
+    out.close();
     std::remove(matIn.c_str());
     std::remove(matOut.c_str());
+
+    // =========================================================================
 
     std::vector<int> demands(n);
     for (int i = 0; i < n; ++i) { demands[i] = config.points[i].demand; }
@@ -261,8 +274,8 @@ bool solve_new_vrp(const std::string& csvPath,
         return false;
     }
 
-    std::ofstream out(outputPath);
-    if (!out.is_open()) { fclose(graph_file); error = "Cannot open output file: " + outputPath; return false; }
+    std::ofstream out_res(outputPath);
+    if (!out_res.is_open()) { fclose(graph_file); error = "Cannot open output file: " + outputPath; return false; }
 
     int64_t global_pure_transit_time = 0;
     int64_t global_dist = 0;
@@ -289,16 +302,13 @@ bool solve_new_vrp(const std::string& csvPath,
         }
     }
 
-    out << "=== New VRP Routing Optimization Result ===\n";
-    out << "Optimized Target: " << (optimize_by_time ? "TIME" : "DISTANCE") << "\n";
-    out << "Global Pure Drive Time (seconds): " << (global_pure_transit_time / 1000.0) << "\n";
-    out << "Global Fleet Distance (meters): " << (global_dist / 1000.0) << "\n";
-    out << "Real Complete Operations Time (seconds): " << max_operation_endtime << " (Makespan)\n";
-    out << "Vehicles Allocated: " << num_vehicles << "\n\n";
+    out_res << "=== New VRP Routing Optimization Result ===\n";
+    out_res << "Optimized Target: " << (optimize_by_time ? "TIME" : "DISTANCE") << "\n";
+    out_res << "Global Pure Drive Time (seconds): " << (global_pure_transit_time / 1000.0) << "\n";
+    out_res << "Global Fleet Distance (meters): " << (global_dist / 1000.0) << "\n";
+    out_res << "Real Complete Operations Time (seconds): " << max_operation_endtime / 1000.0 << " (Makespan)\n";
+    out_res << "Vehicles Allocated: " << num_vehicles << "\n\n";
 
-    // =========================================================================
-    //      1:                                                        
-    // =========================================================================
     for (size_t v = 0; v < vehicle_routes.size(); ++v) {
         int64_t total_route_time = 0;
         int64_t start_time = 0;
@@ -309,119 +319,115 @@ bool solve_new_vrp(const std::string& csvPath,
             end_time = vehicle_arrival_times[v].back();
             total_route_time = end_time - start_time;
         }
-        int64_t waiting_time = total_route_time - (fleet_pure_times[v] / 1000);
+        int64_t waiting_time = total_route_time - (fleet_pure_times[v]);
         if (waiting_time < 0) waiting_time = 0;
 
-        out << "Vehicle " << (v + 1) << " Route Summary:\n"
-            << "  -> Start Time (Departure from Depot): " << start_time << " seconds\n"
-            << "  -> End Time (Return to Depot): " << end_time << " seconds\n"
-            << "  -> Total Duration (incl. waiting): " << total_route_time << " seconds\n"
+        out_res << "Vehicle " << (v + 1) << " Route Summary:\n"
+            << "  -> Start Time (Departure from Depot): " << start_time / 1000.0 << " seconds\n"
+            << "  -> End Time (Return to Depot): " << end_time / 1000.0 << " seconds\n"
+            << "  -> Total Duration (incl. waiting): " << total_route_time / 1000.0 << " seconds\n"
             << "  -> Pure Driving Time: " << (fleet_pure_times[v] / 1000.0) << " seconds\n"
-            << "  -> Waiting at windows: " << waiting_time << " seconds\n"
+            << "  -> Waiting at windows: " << waiting_time / 1000.0 << " seconds\n"
             << "  -> Distance: " << (fleet_dists[v] / 1000.0) << " meters\n"
             << "  -> Max Capacity Limit: " << capacities[v] << "\n";
 
-        out << "  Nodes sequence:\n";
+        out_res << "  Nodes sequence:\n";
         for (size_t i = 0; i < vehicle_routes[v].size(); ++i) {
             int node = vehicle_routes[v][i];
             int64_t arr_sec = vehicle_arrival_times[v][i];
             const auto& pt = config.points[node];
             uint32_t dense_id = node_ids[node];
 
-            out << "    * Arrive: " << arr_sec << "s | Point ID: " << pt.id
+            out_res << "    * Arrive: " << arr_sec / 1000.0 << "s | Point ID: " << pt.id
                 << " [Dense ID: " << dense_id << "] (Lat: " << pt.lat << ", Lon: " << pt.lon << ")";
 
             if (node == 0) {
-                if (i == 0) out << " [START DEPOT]";
-                else out << " [END DEPOT]";
+                if (i == 0) out_res << " [START DEPOT]";
+                else out_res << " [END DEPOT]";
             }
             else {
-                out << " [Demand: " << pt.demand << ", Window: " << pt.tw_start << "-" << pt.tw_end << "]";
+                out_res << " [Demand: " << pt.demand << ", Window: " << pt.tw_start << "-" << pt.tw_end << "]";
             }
-            out << "\n";
+            out_res << "\n";
         }
-        out << "\n";
+        out_res << "\n";
     }
 
     // =========================================================================
-    //      2:                                      OSM ID                  
+    // œ¿ ≈“ÕŒ≈ œŒ—“–Œ≈Õ»≈ œŒÀÕ€’ “–≈ Œ¬ √≈ŒÃ≈“–»» (”¡»–¿≈“ ƒ≈—ﬂ“ » ¬€«Œ¬Œ¬ ‘¿…ÀŒ¬)
     // =========================================================================
     if (full_output) {
-        out << "=== Full Fleet Dense ID Tracks ===\n\n";
+        out_res << "=== Full Fleet Dense ID Tracks ===\n\n";
 
         std::string vIn = "temp_v_track_in.txt";
         std::string vOut = "temp_v_track_out.txt";
 
-        for (size_t v = 0; v < vehicle_routes.size(); ++v) {
-            if (vehicle_routes[v].size() < 2) continue;
+        {
+            std::ofstream in(vIn);
+            if (!in) { fclose(graph_file); error = "Cannot create temp track input file"; return false; }
+            for (size_t v = 0; v < vehicle_routes.size(); ++v) {
+                if (vehicle_routes[v].size() < 2) continue;
+                for (size_t i = 0; i < vehicle_routes[v].size() - 1; ++i) {
+                    in << node_ids[vehicle_routes[v][i]] << " " << node_ids[vehicle_routes[v][i + 1]] << "\n";
+                }
+            }
+        }
 
-            out << "Vehicle " << (v + 1) << " Route Sequence (Full Dense ID Graph Path):\n  ";
+        FILE* inf_track = fopen(vIn.c_str(), "r");
+        FILE* outf_track = fopen(vOut.c_str(), "w");
+        if (inf_track && outf_track) {
+            fseek(graph_file, 0, SEEK_SET);
+            run_search(graph_file, inf_track, outf_track, true, metric); // full_output = true ‰Îˇ „ÂÓÏÂÚËË
+            fclose(inf_track); fclose(outf_track);
+        }
+        else {
+            if (inf_track) fclose(inf_track); if (outf_track) fclose(outf_track);
+        }
 
-            uint32_t last_printed_id = 0;
-            bool is_first_segment = true;
+        std::ifstream path_stream(vOut);
+        if (path_stream.is_open()) {
+            std::string raw_route_line;
+            std::getline(path_stream, raw_route_line); // œÓÔÛÒÍ ·‡ÌÌÂ‡
 
-            //                                                         
-            for (size_t i = 0; i < vehicle_routes[v].size() - 1; ++i) {
-                int from_idx = vehicle_routes[v][i];
-                int to_idx = vehicle_routes[v][i + 1];
+            std::vector<uint32_t> all_nodes;
+            all_nodes.reserve(10000);
 
-                std::ofstream in(vIn);
-                in << node_ids[from_idx] << " " << node_ids[to_idx] << "\n";
-                in.close();
+            for (size_t v = 0; v < vehicle_routes.size(); ++v) {
+                if (vehicle_routes[v].size() < 2) continue;
 
-                FILE* inf = fopen(vIn.c_str(), "r");
-                FILE* outf = fopen(vOut.c_str(), "w");
-                if (inf && outf) {
-                    fseek(graph_file, 0, SEEK_SET);
-                    run_search(graph_file, inf, outf, true, metric);
-                    fclose(inf); fclose(outf);
+                double total_time = 0.0;
+                double total_distance = 0.0;
+                all_nodes.clear();
 
-                    std::ifstream path_stream(vOut);
-                    std::string raw_route_line;
+                for (size_t i = 0; i < vehicle_routes[v].size() - 1; ++i) {
                     if (std::getline(path_stream, raw_route_line)) {
                         std::stringstream ss(raw_route_line);
+                        double seg_time, seg_dist;
+                        uint32_t seg_cnt;
 
-                        if (is_first_segment) {
-                            //                                                               :
-                            // [                    ] [                        ] [           ]
-                            double total_t, total_d;
-                            uint32_t nodes_cnt;
-                            if (ss >> total_t >> total_d >> nodes_cnt) {
-                                out << total_t << " " << total_d << " " << nodes_cnt << " ";
-                            }
+                        if (ss >> seg_time >> seg_dist >> seg_cnt) {
+                            total_time += seg_time;
+                            total_distance += seg_dist;
 
-                            //             ID                 
                             uint32_t osm_node_id;
                             while (ss >> osm_node_id) {
-                                if (osm_node_id != last_printed_id) {
-                                    out << osm_node_id << " ";
-                                    last_printed_id = osm_node_id;
-                                }
-                            }
-                            is_first_segment = false;
-                        }
-                        else {
-                            //                                            (        ,    2-           3- )
-                            //                      3     -     ,                              ,
-                            //                     ID               .
-                            double dummy_t, dummy_d;
-                            uint32_t dummy_cnt;
-                            if (ss >> dummy_t >> dummy_d >> dummy_cnt) {
-                                uint32_t osm_node_id;
-                                while (ss >> osm_node_id) {
-                                    //                      ID                    (               i-        ==           i+1-  )
-                                    if (osm_node_id != last_printed_id) {
-                                        out << osm_node_id << " ";
-                                        last_printed_id = osm_node_id;
-                                    }
+                                if (all_nodes.empty() || osm_node_id != all_nodes.back()) {
+                                    all_nodes.push_back(osm_node_id);
                                 }
                             }
                         }
                     }
-                    path_stream.close();
                 }
+
+                // ¬˚‚Ó‰ ÂÁÛÎ¸Ú‡ÚÓ‚ ‰Îˇ Ï‡¯ËÌ˚
+                out_res << "Vehicle " << (v + 1) << " Route Sequence (Full Dense ID Graph Path):\n  ";
+                out_res << total_time << " " << total_distance << " " << all_nodes.size() << " ";
+                for (uint32_t node_id : all_nodes) {
+                    out_res << node_id << " ";
+                }
+                out_res << "\n\n";
             }
-            out << "\n\n"; //                                     
+            path_stream.close();
         }
         std::remove(vIn.c_str());
         std::remove(vOut.c_str());

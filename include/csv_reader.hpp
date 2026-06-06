@@ -44,3 +44,16 @@ void write_tsp_input_file(const std::string& output_path,
 bool save_id_mapping(const std::vector<TspPoint>& points,
     const std::vector<uint32_t>& dense_ids,
     const std::string& output_path);
+
+/**
+ * @brief Парсер CSV-файла для поиска маршрутов (A*).
+ * Ожидает формат "lat1, lon1, lat2, lon2" на каждой строке.
+ * Игнорирует текстовые заголовки и преобразует данные во временный TXT файл.
+ * * @param csv_path Путь к исходному CSV файлу.
+ * @param txt_out_path Путь для сохранения результата (.txt).
+ * @param error_msg Строка для записи ошибки.
+ * @return true Если парсинг прошел успешно.
+ */
+bool parse_coordinate_pairs_csv_to_txt(const std::string& csv_path,
+    const std::string& txt_out_path,
+    std::string& error_msg);

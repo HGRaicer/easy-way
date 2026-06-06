@@ -176,7 +176,12 @@ bool solve_tsp(const std::string& inputTxtPath,
                 error = "Batch output ended unexpectedly at cell [" + std::to_string(i) + "][" + std::to_string(j) + "]";
                 return false;
             }
-
+            if (raw_route_line[0] == '=')
+                if (!std::getline(all_out, raw_route_line)) {
+                    all_out.close(); std::remove(tempAllInput.c_str()); std::remove(tempAllOutput.c_str());
+                    error = "Batch output ended unexpectedly at cell [" + std::to_string(i) + "][" + std::to_string(j) + "]";
+                    return false;
+                }
             std::stringstream ss(raw_route_line);
             double time_val = 0.0, dist_val = 0.0;
             uint32_t nodes_cnt = 0;
@@ -277,6 +282,8 @@ bool solve_tsp(const std::string& inputTxtPath,
                     << "s, Dist: " << (dist_matrix[from_idx][to_idx] / 1000.0) << "m):\n";
 
                 if (std::getline(final_out, route_geometry_line)) {
+                    if (route_geometry_line[0] == '=')
+                        std::getline(final_out, route_geometry_line);
                     std::stringstream ss(route_geometry_line);
                     double dump_t, dump_d; uint32_t dump_c;
                     // Считываем первые три обязательных числа

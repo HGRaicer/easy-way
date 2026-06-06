@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <iomanip>
 
 namespace {
     constexpr double kPi = 3.14159265358979323846;
@@ -76,6 +77,19 @@ namespace {
         const std::uint32_t lo = std::min(a, b);
         const std::uint32_t hi = std::max(a, b);
         return (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
+    }
+
+    static QString format_time_hms(double total_seconds) {
+        if (total_seconds < 0) total_seconds = 0;
+        unsigned long long total_secs = static_cast<unsigned long long>(total_seconds);
+        unsigned int hours = total_secs / 3600;
+        unsigned int minutes = (total_secs % 3600) / 60;
+        unsigned int seconds = total_secs % 60;
+
+        return QString("%1:%2:%3")
+            .arg(hours, 2, 10, QChar('0'))
+            .arg(minutes, 2, 10, QChar('0'))
+            .arg(seconds, 2, 10, QChar('0'));
     }
 
 }
@@ -172,6 +186,20 @@ protected:
         draw_routes(painter);
         draw_waypoints(painter);
         draw_overlay(painter);
+    }
+
+    std::string format_seconds_to_hhmmss(double seconds) {
+        int total_seconds = static_cast<int>(seconds);
+        int hours = total_seconds / 3600;
+        int minutes = (total_seconds % 3600) / 60;
+        int secs = total_seconds % 60;
+
+        std::ostringstream oss;
+        oss << std::setfill('0')
+            << std::setw(2) << hours << ":"
+            << std::setw(2) << minutes << ":"
+            << std::setw(2) << secs;
+        return oss.str();
     }
 
     void mousePressEvent(QMouseEvent* event) override {
@@ -1190,49 +1218,131 @@ private:
             painter.setPen(route_pen);
             painter.drawLine(world_to_screen(viz_.world_coords[seg.a]),
                 world_to_screen(viz_.world_coords[seg.b]));
+
+            draw_arrow_on_line(painter, world_to_screen(viz_.world_coords[seg.a]),
+                world_to_screen(viz_.world_coords[seg.b]));
         }
 
         draw_route_endpoint_markers(painter);
     }
 
     void draw_route_endpoint_markers(QPainter& painter) {
+        // СПОСОБ 1: Идеальный. Рисуем маркеры по исходным координатам клиентов (waypoints).
+        // Это игнорирует проблемы графа дорог, односторонних улиц и разбиения на леги.
+        if (!viz_.waypoints.empty()) {
+
+            // 1. СНАЧАЛА: Рисуем пунктирные линии "привязки" от зданий до дороги
+            painter.save();
+            painter.setPen(QPen(QColor(120, 120, 120, 180), 1.5, Qt::DashLine));
+
+            for (std::size_t i = 0; i < viz_.waypoints.size(); ++i) {
+                const Waypoint& wp = viz_.waypoints[i];
+                double x = viz_.to_world(wp.lat, wp.lon).x;
+                double y = viz_.to_world(wp.lat, wp.lon).y;
+                QPointF wp_screen = world_to_screen(viz_.to_world(wp.lat, wp.lon));
+
+                double min_dist = std::numeric_limits<double>::max();
+                QPointF closest_road_screen = wp_screen;
+
+                // Ищем ближайший узел дороги (таргет или старт/стоп маршрута)
+                for (const Route& route : viz_.routes) {
+                    if (!route.visible || route.nodes.empty()) continue;
+
+                    std::vector<std::uint32_t> check_nodes;
+                    if (!route.targets.empty()) {
+                        for (const auto& t : route.targets) check_nodes.push_back(t.dense_id);
+                    }
+                    else {
+                        check_nodes.push_back(route.nodes.front());
+                        check_nodes.push_back(route.nodes.back());
+                    }
+
+                    for (std::uint32_t node : check_nodes) {
+                        if (node >= viz_.graph.N) continue;
+                        double p_worldx = viz_.world_coords[node].x;
+                        double p_worldy = viz_.world_coords[node].y;
+
+                        double dx = p_worldx - x;
+                        double dy = p_worldy - y;
+                        double dist = dx * dx + dy * dy;
+
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            closest_road_screen = world_to_screen(viz_.world_coords[node]);
+                        }
+                    }
+                }
+
+                // Если дистанция адекватная, рисуем пунктир соединения
+                if (min_dist < 1e-8 && wp_screen != closest_road_screen) {
+                    painter.drawLine(wp_screen, closest_road_screen);
+                }
+            }
+            painter.restore();
+
+            // 2. ЗАТЕМ: Рисуем сами красивые большие маркеры
+            for (std::size_t i = 0; i < viz_.waypoints.size(); ++i) {
+                const Waypoint& wp = viz_.waypoints[i];
+                QPointF screen_pos = world_to_screen(viz_.to_world(wp.lat, wp.lon));
+                bool is_depot = (i == 0); // Нулевой индекс - синий маркер
+
+                draw_marker(painter, screen_pos, marker_label(i), is_depot);
+            }
+
+            return; // Выходим, идеальные маркеры расставлены!
+        }
+
+        // СПОСОБ 2: Запасной (Fallback). Если waypoints не переданы, 
+        // пытаемся склеить узлы графа, но с ГОРАЗДО бОльшим радиусом (около 150 метров).
         struct EndpointMarker {
             std::uint32_t node = 0;
             int label_index = 0;
+            bool is_depot = false;
         };
 
-        std::unordered_map<std::uint32_t, int> label_by_node;
         std::vector<EndpointMarker> markers;
 
-        auto add_endpoint = [&](std::uint32_t node) {
+        auto add_endpoint = [&](std::uint32_t node, bool is_depot) {
             if (node >= viz_.graph.N) return;
-            const auto it = label_by_node.find(node);
-            if (it != label_by_node.end()) return;
-            const int label_index = static_cast<int>(label_by_node.size());
-            label_by_node.emplace(node, label_index);
-            markers.push_back(EndpointMarker{ node, label_index });
+            const auto& p1 = viz_.world_coords[node];
+
+            for (auto& m : markers) {
+                const auto& p2 = viz_.world_coords[m.node];
+                double dx = p1.x - p2.x;
+                double dy = p1.y - p2.y;
+
+                // Увеличенный порог: 5e-10 в радианах это примерно 140-150 метров.
+                // Склеит точки въезда и выезда со двора в один логический маркер.
+                if (dx * dx + dy * dy < 5e-10) {
+                    if (is_depot) m.is_depot = true;
+                    return;
+                }
+            }
+
+            const int label_index = static_cast<int>(markers.size());
+            markers.push_back(EndpointMarker{ node, label_index, is_depot });
             };
 
         for (const Route& route : viz_.routes) {
-            if (!route.visible || route.nodes.size() < 2) continue;
+            if (!route.visible) continue;
 
-            std::uint32_t first = std::numeric_limits<std::uint32_t>::max();
-            std::uint32_t last = std::numeric_limits<std::uint32_t>::max();
-
-            for (std::uint32_t node : route.nodes) {
-                if (node >= viz_.graph.N) continue;
-                if (first == std::numeric_limits<std::uint32_t>::max()) first = node;
-                last = node;
+            if (!route.targets.empty()) {
+                for (const auto& target : route.targets) {
+                    add_endpoint(target.dense_id, target.is_depot);
+                }
             }
-
-            if (first != std::numeric_limits<std::uint32_t>::max()) add_endpoint(first);
-            if (last != std::numeric_limits<std::uint32_t>::max()) add_endpoint(last);
+            else if (route.nodes.size() >= 2) {
+                // Извлекаем только старт и финиш текущего сегмента
+                add_endpoint(route.nodes.front(), true);
+                add_endpoint(route.nodes.back(), false);
+            }
         }
 
         for (const EndpointMarker& marker : markers) {
             draw_marker(painter,
                 world_to_screen(viz_.world_coords[marker.node]),
-                marker_label(marker.label_index));
+                marker_label(marker.label_index),
+                marker.is_depot);
         }
     }
 
@@ -1249,16 +1359,62 @@ private:
         }
     }
 
-    void draw_marker(QPainter& painter, const QPointF& p, const QString& text) {
-        const QColor red(230, 60, 60);
+    void draw_marker(QPainter& painter, const QPointF& p, const QString& text, bool is_depot = false) {
+        const QColor target_color(230, 60, 60); // Красный для обычных точек
+        const QColor depot_color(60, 150, 230); // Синий для депо
 
         painter.setPen(QPen(Qt::white, 2.0));
-        painter.setBrush(red);
+
+        // Устанавливаем цвет кисти в зависимости от флага is_depot
+        painter.setBrush(is_depot ? depot_color : target_color);
         painter.drawEllipse(p, 8.5, 8.5);
 
         painter.setPen(Qt::white);
         const QRectF label_rect(p.x() - 8.5, p.y() - 9.0, 17.0, 17.0);
         painter.drawText(label_rect, Qt::AlignCenter, text);
+    }
+
+    void draw_arrow_on_line(QPainter& painter, const QPointF& from, const QPointF& to) {
+        QLineF line(from, to);
+        // Если сегмент на экране слишком короткий, не рисуем
+        if (line.length() < 28.0) return;
+
+        // Находим точку на 60% длины отрезка (чтобы стрелки не слипались в углах)
+        QPointF mid = line.pointAt(0.6);
+
+        double angle = std::atan2(line.dy(), line.dx());
+
+        double arrow_size = 7.0;    // Размер наконечника
+        double arrow_angle = 0.5;   // Угол разлета «ушек»
+
+        
+        QPointF arrow_p1 = mid - QPointF(std::cos(angle + arrow_angle), std::sin(angle + arrow_angle)) * arrow_size;
+        QPointF arrow_p2 = mid - QPointF(std::cos(angle - arrow_angle), std::sin(angle - arrow_angle)) * arrow_size;
+
+        // Точка "вдавленности" сзади наконечника
+        QPointF arrow_base = mid - QPointF(std::cos(angle), std::sin(angle)) * (arrow_size * 0.6);
+
+        // Короткий, аккуратный хвостик (линия)
+        QPointF tail_end = mid - QPointF(std::cos(angle), std::sin(angle)) * (arrow_size * 1.8);
+
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing, true);
+
+        // 1. Отрисовка хвостика стрелки
+        painter.setPen(QPen(Qt::black, 3.0, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(arrow_base, tail_end);
+        painter.setPen(QPen(Qt::white, 1.2, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(arrow_base, tail_end);
+
+        // 2. Отрисовка самого наконечника
+        painter.setPen(QPen(Qt::black, 1.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.setBrush(Qt::white);
+
+        QPolygonF arrow_head;
+        arrow_head << mid << arrow_p1 << arrow_base << arrow_p2;
+        painter.drawPolygon(arrow_head);
+
+        painter.restore();
     }
 
     void draw_overlay(QPainter& painter) {
@@ -1329,13 +1485,23 @@ private:
             painter.setBrush(to_qcolor(route_palette_color(i)));
             painter.drawRoundedRect(QRectF(24, y - 9, 26, 7), 3, 3);
 
+            // Формируем красивую строку времени
+            QString time_info = format_time_hms(r.total_time_s); // Общая длительность
+            if (!r.targets.empty()) {
+                // Добавляем [Время_Старта -> Время_Финиша]
+                if ((r.targets.back().arrival_time_s - r.targets.front().arrival_time_s) > 1e-12)
+                    time_info += QString(" [%1 → %2]")
+                        .arg(format_time_hms(r.targets.front().arrival_time_s))
+                        .arg(format_time_hms(r.targets.back().arrival_time_s));
+            }
+
             painter.setPen(QColor(245, 245, 245));
             painter.drawText(58, y,
-                QString("%1: %2 nodes, distance %3 m, time %4 s")
+                QString("%1: %2 nodes | %3 m | %4")
                 .arg(label)
                 .arg(r.nodes.size())
                 .arg(r.total_dist_m, 0, 'f', 1)
-                .arg(r.total_time_s, 0, 'f', 1)
+                .arg(time_info) // Подставляем расширенную строку времени
             );
 
             y += route_row_height;
@@ -1348,6 +1514,21 @@ private:
     }
 };
 
+QWidget* GraphVisualizer::createWidget(QWidget* parent) {
+    if (graph.N == 0) return nullptr;
+
+    m_activeWidget = new QtGraphWidget(*this, parent);
+    return m_activeWidget;
+}
+
+// Метод для принудительного обновления экрана
+void GraphVisualizer::updateVisuals() {
+    if (m_activeWidget) {
+        m_activeWidget->update(); // Вызывает paintEvent внутри Qt
+    }
+}
+
+// Обновленный run() — теперь он не ломает программу, если QApplication уже создан главным окном
 void GraphVisualizer::run() {
     if (graph.N == 0) return;
 
@@ -1355,10 +1536,20 @@ void GraphVisualizer::run() {
     char app_name[] = "graph_builder";
     char* argv[] = { app_name, nullptr };
 
-    QApplication app(argc, argv);
+    // Проверяем, существует ли уже QApplication (если запустили из GUI)
+    QApplication* app = qobject_cast<QApplication*>(QApplication::instance());
+    bool own_app = false;
+
+    if (!app) {
+        app = new QApplication(argc, argv);
+        own_app = true;
+    }
 
     QtGraphWidget window(*this);
     window.show();
 
-    app.exec();
+    if (own_app) {
+        app->exec();
+        delete app;
+    }
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(practica LANGUAGES CXX)
+project(easy_way LANGUAGES CXX)
 set(VCPKG_BUILD_TYPE release CACHE STRING "")
 
 if (MSVC)
@@ -79,14 +79,11 @@ if (WITH_ORTOOLS_FETCHCONTENT)
     set(EASY_WAY_ORTOOLS_ENABLED ON)
     message(STATUS "OR-Tools: enabled via FetchContent")
 
-elseif (NOT WITH_ORTOOLS_TSP_UPPER STREQUAL "OFF")
-    # 1.                                     
+elseif (NOT WITH_ORTOOLS_TSP_UPPER STREQUAL "OFF")                                   
     if (NOT ORTOOLS_ROOT)
         set(ORTOOLS_ROOT "${PROJECT_SOURCE_DIR}/external/or-tools")
     endif()
-
-    # 2.                                      CMake
-    #              find_package                    external/or-tools                    
+             
     list(APPEND CMAKE_PREFIX_PATH "${ORTOOLS_ROOT}")
     
     find_package(ortools CONFIG QUIET)
@@ -108,9 +105,8 @@ else()
 endif()
 
 # ---------------- Project sources ----------------
-set(GRAPH_BUILDER_SOURCES
+set(easy-way-sour 
     main.cpp
-    src/osm_graph.cpp
     src/preprocess.cpp
     src/search.cpp
     src/geocode.cpp
@@ -118,7 +114,13 @@ set(GRAPH_BUILDER_SOURCES
     src/graph_loader.cpp 
     src/vrp_solver.cpp
     src/csv_reader.cpp
+    src/mainwindow.cpp
+    include/mainwindow.hpp
 )
+
+if (WIN32)
+    list(APPEND easy-way-sour app.rc)
+endif()
 
 # Optional local TSP implementation file.
 if (TARGET ortools::ortools OR EASY_WAY_ORTOOLS_ENABLED)
@@ -127,12 +129,11 @@ else()
     set(ORTOOLS_FOUND_AND_READY OFF)
 endif()
 
-#      OR-Tools               ,                           TSP
 if (ORTOOLS_FOUND_AND_READY)
-    list(APPEND GRAPH_BUILDER_SOURCES src/tsp.cpp)
+    list(APPEND easy-way-sour src/tsp.cpp)
 endif()
 
-add_executable(graph_builder ${GRAPH_BUILDER_SOURCES})
+add_executable(easy-way ${easy-way-sour})
 
 # 1. Ищем пакет OpenMP в системе
 find_package(OpenMP REQUIRED)
@@ -141,16 +142,16 @@ find_package(Boost REQUIRED)
 
 # 2. Если пакет найден, связываем его с вашим исполняемым файлом
 if(OpenMP_CXX_FOUND)
-    target_link_libraries(graph_builder PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(easy-way PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 if(Boost_FOUND)
-    target_include_directories(graph_builder PRIVATE ${Boost_INCLUDE_DIRS})
+    target_include_directories(easy-way PRIVATE ${Boost_INCLUDE_DIRS})
 endif()
 
-target_compile_features(graph_builder PRIVATE cxx_std_20)
+target_compile_features(easy-way PRIVATE cxx_std_20)
 
-set_target_properties(graph_builder PROPERTIES
+set_target_properties(easy-way PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
@@ -166,24 +167,24 @@ find_package(ZLIB REQUIRED)
 find_package(BZip2 REQUIRED)
 find_package(expat REQUIRED)
 
-target_include_directories(graph_builder PRIVATE
+target_include_directories(easy-way PRIVATE
     "${PROJECT_SOURCE_DIR}/include"
     "${OSMIUM_INCLUDE_DIR}"
 )
 
 if (ORTOOLS_FOUND_AND_READY)
-    target_include_directories(graph_builder BEFORE PRIVATE 
+    target_include_directories(easy-way BEFORE PRIVATE 
         "${CMAKE_BINARY_DIR}/_deps/absl-src"
         "${CMAKE_BINARY_DIR}/_deps/ortools-src"
     )
 
-    target_compile_definitions(graph_builder PRIVATE 
+    target_compile_definitions(easy-way PRIVATE 
         ABSL_CONSUME_DLL
     )
 
 
-    target_compile_definitions(graph_builder PRIVATE WITH_ORTOOLS_TSP=1)
-    target_link_libraries(graph_builder 
+    target_compile_definitions(easy-way PRIVATE WITH_ORTOOLS_TSP=1)
+    target_link_libraries(easy-way 
     PRIVATE 
         ortools::ortools
         
@@ -195,10 +196,10 @@ if (ORTOOLS_FOUND_AND_READY)
             "${EASY_WAY_ORTOOLS_ROOT}/lib/*.dll"
         )
         if (ORTOOLS_RUNTIME_DLLS)
-            add_custom_command(TARGET graph_builder POST_BUILD
+            add_custom_command(TARGET easy-way POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     ${ORTOOLS_RUNTIME_DLLS}
-                    "$<TARGET_FILE_DIR:graph_builder>"
+                    "$<TARGET_FILE_DIR:easy-way>"
                 COMMENT "Copying OR-Tools runtime DLLs"
                 VERBATIM
             )
@@ -207,7 +208,7 @@ if (ORTOOLS_FOUND_AND_READY)
 endif()
 
 
-target_link_libraries(graph_builder PRIVATE
+target_link_libraries(easy-way PRIVATE
     Qt6::Widgets
     nlohmann_json::nlohmann_json
     spdlog::spdlog
@@ -218,8 +219,7 @@ target_link_libraries(graph_builder PRIVATE
 
 # ---------------- Windows & Compiler Flags ----------------
 if (WIN32)
-    # Critical for libosmium on Windows: min/max can break std::numeric_limits::max.
-    target_compile_definitions(graph_builder PRIVATE
+    target_compile_definitions(easy-way PRIVATE
         NOMINMAX
         WIN32_LEAN_AND_MEAN
         VC_EXTRALEAN
@@ -231,8 +231,8 @@ if (WIN32)
     )
 
     if (EXISTS "${WINDEPLOYQT_EXE}")
-        add_custom_command(TARGET graph_builder POST_BUILD
-            COMMAND "${WINDEPLOYQT_EXE}" "$<TARGET_FILE:graph_builder>"
+        add_custom_command(TARGET easy-way POST_BUILD
+            COMMAND "${WINDEPLOYQT_EXE}" "$<TARGET_FILE:easy-way>"
             COMMENT "Deploying Qt runtime files with windeployqt"
             VERBATIM
         )
@@ -242,31 +242,31 @@ if (WIN32)
 endif()
 
 if (MSVC)
-    target_compile_options(graph_builder PRIVATE
-        /W4
+    target_compile_options(easy-way PRIVATE
+        /W0
         /permissive-
         /utf-8
         /bigobj
-        /Zc:__cplusplus  #           :                          ,               __cplusplus                        C++20
+        /Zc:__cplusplus 
     )
     
-    #           :                                    "/FORCE:MULTIPLE",                                        .
+    
 
     if (WITH_ORTOOLS_FETCHCONTENT)
-        target_compile_options(graph_builder PRIVATE /Zm2000)
+        target_compile_options(easy-way PRIVATE /Zm2000)
     endif()
 
     if (RMVP_WARNINGS_AS_ERRORS)
-        target_compile_options(graph_builder PRIVATE /WX)
+        target_compile_options(easy-way PRIVATE /WX)
     endif()
 else()
-    target_compile_options(graph_builder PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(easy-way PRIVATE -w)
 
     if (RMVP_WARNINGS_AS_ERRORS)
-        target_compile_options(graph_builder PRIVATE -Werror)
+        target_compile_options(easy-way PRIVATE -Werror)
     endif()
 endif()
 
 if (COMMAND qt_finalize_executable)
-    qt_finalize_executable(graph_builder)
+    qt_finalize_executable(easy-way)
 endif()

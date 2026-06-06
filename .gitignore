@@ -52,3 +52,8 @@ out/
 /fleet.csv
 /points.csv
 /vrp_points.csv
+/input.csv
+/app.rc.bak
+/docs/osm_graph.docx
+/docs/osm_preprocessor.docx
+/input.txt

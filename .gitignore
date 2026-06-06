@@ -52,3 +52,5 @@ out/
 /fleet.csv
 /points.csv
 /vrp_points.csv
+/input.csv
+/app.rc.bak
